@@ -30,7 +30,8 @@ def main(cfg):
 
     model_path = cfg.model_path
     parse_filename(cfg, model_path)   
-    net = Student2D(s=cfg.size, K=cfg.K, modes=cfg.modes, width=cfg.width, n_layers=cfg.n_layers).to(cfg.device)
+    net = Student2D(s=cfg.size, K=cfg.K, modes=cfg.modes, width=cfg.width,
+                    n_layers=cfg.n_layers, n_fields=2, n_params=5).to(cfg.device)
     net.load_state_dict(torch.load(model_path, map_location=cfg.device), strict=False)
 
     dateTimeObj = datetime.now()
@@ -110,10 +111,6 @@ if __name__ == "__main__":
             help='num of training data')
 
     cfg = parser.parse_args()
-    cfg.data_name = '_0.2_0.5'
-    cfg.file_name = 'search_param' + cfg.data_name
-    main(cfg)
-
-    cfg.data_name = '_1_1'
+    cfg.data_name = '_a1.0_k1.0_v-4.3'
     cfg.file_name = 'search_param' + cfg.data_name
     main(cfg)

@@ -48,12 +48,14 @@ def main(cfg):
         modes=modes, 
         width=width, 
         output_dim=output_dim, 
-        n_layers=n_layers
+        n_layers=n_layers,
+        n_fields=2, n_params=5
         ).to(cfg.device)
 
     net_t.load_state_dict(torch.load(model_path, map_location=cfg.device), strict=False)
 
-    net_s = Student2D(s=cfg.student_size, K=cfg.K, modes=cfg.modes, width=cfg.width, n_layers=cfg.n_layers).to(cfg.device)
+    net_s = Student2D(s=cfg.student_size, K=cfg.K, modes=cfg.modes, width=cfg.width,
+                      n_layers=cfg.n_layers, n_fields=2, n_params=5).to(cfg.device)
  
     dateTimeObj = datetime.now()
     timestring = f'{dateTimeObj.date().month}_{dateTimeObj.date().day}_{dateTimeObj.time().hour}_{dateTimeObj.time().minute}_{dateTimeObj.time().second}'
@@ -87,7 +89,7 @@ if __name__ == "__main__":
     parser.add_argument('--data_name', type=str, default='',
             help='data file name')
 
-    parser.add_argument('--device', type=str, default='cuda:3',
+    parser.add_argument('--device', type=str, default='cuda:0',
                         help='Used device')
     
     parser.add_argument('--seed', type=int, default=0,
@@ -123,8 +125,8 @@ if __name__ == "__main__":
     parser.add_argument('--rollout_DT', type=float, default=1.0,
             help='the length of time interval of each roll-out')
 
-    parser.add_argument('--rollout_DT_teacher', type=float, default=0.2,
-            help='the length of time interval of each roll-out')
+    parser.add_argument('--rollout_DT_teacher', type=float, default=1.0,
+            help='teacher rollout_DT (HW: 1.0s, teacher_step=1)')
 
     parser.add_argument('--lr', type=float, default=0.001,
             help='lr of optim')

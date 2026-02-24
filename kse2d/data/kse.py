@@ -74,3 +74,65 @@ def ks_2d_rk4(u0, T, param, dt=1e-3, record_steps=100):
             c += 1
 
     return sol
+
+
+# ===== HW solver 封装: 调用 mhd_sim =====
+import sys
+sys.path.insert(0, '/zhangtao/project2026/mhd_sim')
+from numerical.equations.hasegawa_wakatani import HasegawaWakatani, HWConfig
+from numerical.scripts.hw_eq import rk4_step as hw_rk4_step
+
+
+def hw_2d_rk4(zeta0, n0, T, param, k0=0.15, N_hyper=3,
+              dt=0.025, record_steps=250, device='cuda'):
+    """
+    param: [B,3] → α=param[:,0], κ=param[:,1], log₁₀ν=param[:,2]
+    返回: [B, S, S, record_steps+1, 2]  (最后维: 0=ζ, 1=n)
+    逐样本调用 mhd_sim solver (各样本参数可不同)
+    """
+    B = zeta0.shape[0]
+    S = zeta0.shape[1]
+    steps = int(T / dt)
+    save_every = max(1, steps // record_steps)
+
+    sol = torch.zeros(B, S, S, record_steps + 1, 2, device='cpu')
+
+    for b in range(B):
+        alpha_val = param[b, 0].item()
+        kappa_val = param[b, 1].item()
+        nu_val = 10 ** param[b, 2].item()
+
+        cfg = HWConfig(
+            Nx=S, Ny=S, k0=k0,
+            alpha=alpha_val, kappa=kappa_val,
+            nu=nu_val, hyper_order=N_hyper,
+            dt=dt, Nt=steps, stamp_interval=save_every,
+            device=str(device), output_path=None,
+        )
+        hw = HasegawaWakatani(cfg)
+
+        # 初始状态 [2, S, S], float64
+        state = torch.stack([
+            zeta0[b].to(torch.float64).to(device),
+            n0[b].to(torch.float64).to(device)
+        ], dim=0)
+
+        sol[b, :, :, 0, 0] = state[0].cpu().float()
+        sol[b, :, :, 0, 1] = state[1].cpu().float()
+
+        c = 1
+        with torch.no_grad():
+            for i in range(steps):
+                state = hw_rk4_step(hw.compute_rhs, state, dt)
+                if (i + 1) % save_every == 0 and c <= record_steps:
+                    sol[b, :, :, c, 0] = state[0].cpu().float()
+                    sol[b, :, :, c, 1] = state[1].cpu().float()
+                    if c % 50 == 0:
+                        print(f"  Sample {b}, frame {c}/{record_steps}, "
+                              f"t={(i+1)*dt:.2f}s, max|ζ|={state[0].abs().max():.4f}")
+                    c += 1
+
+        if torch.isnan(state).any():
+            print(f"WARNING: NaN detected in sample {b}")
+
+    return sol

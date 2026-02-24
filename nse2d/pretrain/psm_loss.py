@@ -1,64 +1,88 @@
+"""Physics loss for 5-field MHD using mhd_sim's compute_rhs.
 
+Computes time-differencing loss between OmniFluids multi-frame predictions
+and the physical RHS (right-hand side) from the 5-field Landau-fluid equations.
+"""
+
+import sys
 import torch
-import math
-EPS = 1e-7
+import torch.nn.functional as F
+
+sys.path.insert(0, '/zhangtao/project2026/mhd_sim')
+from numerical.equations.five_field_mhd import FiveFieldMHD, FiveFieldMHDConfig
 
 
-def PSM_NS_vorticity(w, v, t_interval=5.0, loss_mode='cn'):
-    batchsize = w.size(0)
-    nx = w.size(1)
-    ny = w.size(2)
-    nt = w.size(3)
-    device = w.device
-    w = w.reshape(batchsize, nx, ny, nt)
+def make_mhd5_rhs_fn(mhd, model_dtype=torch.float32):
+    """Create an RHS adapter: channel-last (B, Nx, Ny, 5) -> (B, Nx, Ny, 5).
 
-    w_h = torch.fft.fft2(w, dim=[1, 2])
-    # Wavenumbers in y-direction
-    k_max = nx//2
-    N = nx
-    k_x = torch.cat((torch.arange(start=0, end=k_max, step=1, device=device),
-                     torch.arange(start=-k_max, end=0, step=1, device=device)), 0).reshape(N, 1).repeat(1, N).reshape(1,N,N,1)
-    k_y = torch.cat((torch.arange(start=0, end=k_max, step=1, device=device),
-                     torch.arange(start=-k_max, end=0, step=1, device=device)), 0).reshape(1, N).repeat(N, 1).reshape(1,N,N,1)
-    # Negative Laplacian in Fourier space
-    lap = k_x ** 2 + k_y ** 2
-    lap[0, 0, 0, 0] = 1.0
-    f_h = w_h / lap
+    The FiveFieldMHD.compute_rhs expects a tuple of 5 tensors each (B, Nx, Ny)
+    and returns a tuple of 5 tensors. This adapter handles the conversion,
+    computing RHS in float64 for numerical accuracy.
 
-    ux_h = 1j * k_y * f_h
-    uy_h = -1j * k_x * f_h
-    wx_h = 1j * k_x * w_h
-    wy_h = 1j * k_y * w_h
-    wlap_h = -lap * w_h
-
-    ux = torch.fft.irfft2(ux_h[:, :, :k_max + 1], dim=[1, 2])
-    uy = torch.fft.irfft2(uy_h[:, :, :k_max + 1], dim=[1, 2])
-    wx = torch.fft.irfft2(wx_h[:, :, :k_max+1], dim=[1,2])
-    wy = torch.fft.irfft2(wy_h[:, :, :k_max+1], dim=[1,2])
-    wlap = torch.fft.irfft2(wlap_h[:, :, :k_max+1], dim=[1,2])
-    dt = t_interval / (nt-1)
-
-    if loss_mode=='cn':
-        wt = (w[:, :, :, 1:] - w[:, :, :, :-1]) / ( dt)
-        Du = (ux*wx + uy*wy - v.reshape(-1, 1, 1, 1)*wlap) #- forcing
-        Du1 = wt + (Du[..., :-1] + Du[..., 1:]) * 0.5 
-    if loss_mode=='mid':
-        wt = (w[:, :, :, 2:] - w[:, :, :, :-2]) / (2 * dt)
-        Du1 = wt + (ux*wx + uy*wy - v.reshape(-1, 1, 1, 1)*wlap)[...,1:-1] #- forcing
-    return Du1
+    Args:
+        mhd: FiveFieldMHD instance
+        model_dtype: dtype of the model output (default float32)
+    """
+    def rhs_fn(x):
+        # x: (B, Nx, Ny, 5), model_dtype
+        x_f64 = x.to(torch.float64)
+        state = tuple(x_f64[..., i] for i in range(5))
+        rhs_tuple = mhd.compute_rhs(state)
+        return torch.stack(rhs_tuple, dim=-1).to(model_dtype)
+    return rhs_fn
 
 
-def PSM_loss(u, forcing, v, t_interval=0.50, loss_mode='cn'):
-    batchsize = u.size(0)
-    nx = u.size(1)
-    ny = u.size(2)
-    nt = u.size(3)
-    u = u.reshape(batchsize, nx, ny, nt)
-    Du = PSM_NS_vorticity(u, v, t_interval, loss_mode)
-    if loss_mode == 'cn':
-        forcing = forcing.reshape(-1, nx, ny, 1)
-        f = forcing.repeat(1, 1, 1, nt-1)
-    if loss_mode == 'mid':
-       forcing = forcing.reshape(-1, nx, ny, 1)
-       f = forcing.repeat(1, 1, 1, nt-2)
-    return (torch.square(Du - f).mean() + EPS).sqrt()
+def build_mhd_instance(device='cpu', Nx=512, Ny=256):
+    """Build a FiveFieldMHD instance with default config.
+
+    RHS computation always runs in float64 for numerical accuracy.
+    """
+    cfg = FiveFieldMHDConfig()
+    cfg.Nx = Nx
+    cfg.Ny = Ny
+    cfg.device = str(device)
+    cfg.precision = 'fp64'
+    mhd = FiveFieldMHD(cfg)
+    return mhd
+
+
+def compute_physics_loss(pred_traj, x_0, rhs_fn, rollout_dt, output_dim,
+                         time_integrator='crank_nicolson'):
+    """Multi-frame physics loss using mhd_sim's RHS.
+
+    For each consecutive frame pair in the trajectory, enforce:
+        (state[t+1] - state[t]) / dt ≈ target_rhs
+
+    where target_rhs depends on the time integrator.
+
+    Args:
+        pred_traj: (B, Nx, Ny, 5, output_dim) multi-frame model output
+        x_0: (B, Nx, Ny, 5) initial state
+        rhs_fn: callable (B, Nx, Ny, 5) -> (B, Nx, Ny, 5)
+        rollout_dt: total time span covered by output_dim frames
+        output_dim: number of predicted frames
+        time_integrator: 'euler' or 'crank_nicolson'
+
+    Returns:
+        scalar loss (MSE between time derivative and RHS)
+    """
+    dt = rollout_dt / output_dim
+    full_traj = torch.cat([x_0.unsqueeze(-1), pred_traj], dim=-1)
+
+    total_loss = torch.tensor(0.0, device=x_0.device, dtype=x_0.dtype)
+
+    for t in range(output_dim):
+        state_t = full_traj[..., t]
+        state_tp1 = full_traj[..., t + 1]
+        time_diff = (state_tp1 - state_t) / dt
+
+        if time_integrator == 'euler':
+            target = rhs_fn(state_t)
+        elif time_integrator == 'crank_nicolson':
+            target = (rhs_fn(state_t) + rhs_fn(state_tp1)) / 2.0
+        else:
+            raise ValueError(f"Unknown integrator: {time_integrator}")
+
+        total_loss = total_loss + F.mse_loss(time_diff, target.detach())
+
+    return total_loss / output_dim

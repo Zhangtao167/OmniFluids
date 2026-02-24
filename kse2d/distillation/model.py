@@ -76,7 +76,8 @@ class SpectralConv2d_dy(nn.Module):
 
 class OmniFluids2D(nn.Module):
     def __init__(self, s=256, K=4, T=10, modes=16, width=60, output_dim=40,
-                 n_layers=16, factor=4, n_ff_layers=2, layer_norm=True):
+                 n_layers=16, factor=4, n_ff_layers=2, layer_norm=True,
+                 n_fields=2, n_params=5):
         super().__init__()
         self.modes = modes
         self.width = width
@@ -87,17 +88,18 @@ class OmniFluids2D(nn.Module):
         self.fourier_weight = None
         self.K = K
         self.T = T
+        self.n_fields = n_fields
+        self.n_params = n_params
 
         grid = self.get_grid((1, s, s))
         self.register_buffer('grid', grid)
-        self.in_proj = nn.Linear(5, self.width)
+        self.in_proj = nn.Linear(n_fields + 2 + n_params, self.width)
 
         self.f_nu = nn.ModuleList([])
         for _ in range(n_layers):
-            self.f_nu.append(nn.Sequential(nn.Linear(2, 128),
+            self.f_nu.append(nn.Sequential(nn.Linear(n_params, 128),
                                      nn.GELU(), nn.Linear(128, 128),
                                      nn.GELU(), nn.Linear(128, self.K)))
-
 
         self.spectral_layers = nn.ModuleList([])
         for _ in range(n_layers):
@@ -113,14 +115,14 @@ class OmniFluids2D(nn.Module):
         self.fc1b = nn.Linear(self.width, 34)
         self.output_mlp = nn.Sequential(nn.Conv1d(1, 8, 12, stride=2),
                             nn.GELU(),
-                            nn.Conv1d(8, 1, 12, stride=2)
-                            ) 
-        
+                            nn.Conv1d(8, n_fields, 12, stride=2)
+                            )
+
     def forward(self, x, param, inference=False, **kwargs):
-        batch_size, size = x.shape[0], x.shape[1] 
+        batch_size, size = x.shape[0], x.shape[1]
         x_o = x
         x = torch.cat((x, self.grid.repeat(batch_size, 1, 1, 1)), dim=-1)
-        x = torch.cat((x, param.reshape(batch_size, 1, 1, 2).repeat(1, size, size, 1)), dim=-1)
+        x = torch.cat((x, param.reshape(batch_size, 1, 1, self.n_params).repeat(1, size, size, 1)), dim=-1)
         x = self.in_proj(x)
         x = F.gelu(x)
         for i in range(self.n_layers):
@@ -129,16 +131,24 @@ class OmniFluids2D(nn.Module):
             att = F.softmax(att/self.T, dim=-1)
             layer = self.spectral_layers[i]
             b = layer(x, att)
-            x = x + b    
+            x = x + b
         x = F.gelu(b)
-        if inference==False:
+        if inference == False:
             x = torch.concat([self.fc1a(x), self.fc1b(x)], dim=-1)
         else:
             x = self.fc1b(x)
         x = F.gelu(x)
-        x = self.output_mlp(x.reshape(-1, 1, x.shape[-1])).reshape(batch_size, size, size, -1)
-        dt = torch.arange(1, x.shape[-1] + 1, device=x.device).reshape(1, 1, 1, -1) / x.shape[-1]
-        x = x_o + x * dt
+
+        x = self.output_mlp(x.reshape(-1, 1, x.shape[-1]))
+        x = x.reshape(batch_size, size, size, self.n_fields, -1)
+        x = x.permute(0, 1, 2, 4, 3)
+
+        Tp = x.shape[3]
+        dt = torch.arange(1, Tp + 1, device=x.device).reshape(1, 1, 1, -1, 1).float() / Tp
+        x = x_o.unsqueeze(-2) + x * dt
+
+        if inference:
+            x = x.squeeze(-2)
         return x
 
     def get_grid(self, shape, device='cpu'):
@@ -153,7 +163,8 @@ class OmniFluids2D(nn.Module):
 
 class Student2D(nn.Module):
     def __init__(self, s=256, K=4, T=10, modes=16, width=60, output_dim=40,
-                 n_layers=16, factor=4, n_ff_layers=2, layer_norm=True):
+                 n_layers=16, factor=4, n_ff_layers=2, layer_norm=True,
+                 n_fields=2, n_params=5):
         super().__init__()
         self.modes = modes
         self.width = width
@@ -164,17 +175,18 @@ class Student2D(nn.Module):
         self.fourier_weight = None
         self.K = K
         self.T = T
+        self.n_fields = n_fields
+        self.n_params = n_params
 
         grid = self.get_grid((1, s, s))
         self.register_buffer('grid', grid)
-        self.in_proj = nn.Linear(5, self.width)
+        self.in_proj = nn.Linear(n_fields + 2 + n_params, self.width)
 
         self.f_nu = nn.ModuleList([])
         for _ in range(n_layers):
-            self.f_nu.append(nn.Sequential(nn.Linear(2, 128),
+            self.f_nu.append(nn.Sequential(nn.Linear(n_params, 128),
                                      nn.GELU(), nn.Linear(128, 128),
                                      nn.GELU(), nn.Linear(128, self.K)))
-
 
         self.spectral_layers = nn.ModuleList([])
         for _ in range(n_layers):
@@ -188,14 +200,14 @@ class Student2D(nn.Module):
 
         self.output_mlp_student = nn.Sequential(nn.Linear(self.width, 4 * self.width),
                             nn.GELU(),
-                            nn.Linear(4 * self.width, 1)
-                            ) 
-        
+                            nn.Linear(4 * self.width, n_fields)
+                            )
+
     def forward(self, x, param, **kwargs):
-        batch_size, size = x.shape[0], x.shape[1] 
-        x_o = x
+        batch_size, size = x.shape[0], x.shape[1]
+        x_o = x   # [B,S,S,n_fields]
         x = torch.cat((x, self.grid.repeat(batch_size, 1, 1, 1)), dim=-1)
-        x = torch.cat((x, param.reshape(batch_size, 1, 1, 2).repeat(1, size, size, 1)), dim=-1)
+        x = torch.cat((x, param.reshape(batch_size, 1, 1, self.n_params).repeat(1, size, size, 1)), dim=-1)
         x = self.in_proj(x)
         x = F.gelu(x)
         for i in range(self.n_layers):
@@ -204,10 +216,10 @@ class Student2D(nn.Module):
             att = F.softmax(att/self.T, dim=-1)
             layer = self.spectral_layers[i]
             b = layer(x, att)
-            x = x + b    
+            x = x + b
         x = F.gelu(b)
-        x = self.output_mlp_student(x)
-        x = x_o + x 
+        x = self.output_mlp_student(x)  # [B,S,S,n_fields]
+        x = x_o + x
         return x
 
     def get_grid(self, shape, device='cpu'):

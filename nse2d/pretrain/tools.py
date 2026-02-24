@@ -1,123 +1,101 @@
-import matplotlib.pyplot as plt
+"""Utility functions for 5-field MHD OmniFluids training.
+
+Provides:
+- setup_seed: reproducibility
+- param_count: model parameter counting
+- load_mhd5_snapshots: load offline MHD data as channel-last snapshots
+"""
+
 import torch
 import numpy as np
-import math
 import random
 import os
 from functools import reduce
 import operator
-from thop import profile
+
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+FIELD_NAMES = ['n', 'U', 'vpar', 'psi', 'Ti']
 
 
 def setup_seed(seed):
-     torch.manual_seed(seed)
-     torch.cuda.manual_seed(seed)
-     torch.cuda.manual_seed_all(seed)
-     np.random.seed(seed)
-     random.seed(seed)
-     os.environ['PYTHONHASHSEED'] = str(seed) 
-     torch.backends.cudnn.deterministic = True
-     torch.backends.cudnn.benchmark = False
-     torch.backends.cudnn.enabled = True
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.enabled = True
 
 
-def param_flops(net):
-    device = next(net.parameters()).device
-    dummy_input = torch.randn(1, 128, 128, net.output_dim, device=device)
-    dummy_input2 = torch.randn(1, 128, 128, 2, device=device)
-
+def param_count(net):
+    """Count and print model parameters."""
     params = 0
-    for p in list(net.parameters()):
-        params += reduce(operator.mul, 
-                    list(p.size()+(2,) if p.is_complex() else p.size()))
-    # flops, _ = profile(net, (dummy_input, dummy_input2), verbose=False)
-    # print('flops: %.3f M, params: %.3f M' % (flops / 1000000.0, params / 1000000.0))
-    print(' params: %.3f M' % (params / 1000000.0))
+    for p in net.parameters():
+        params += reduce(operator.mul,
+                         list(p.size() + (2,) if p.is_complex() else p.size()))
+    print(f' params: {params / 1e6:.3f} M')
     return params
 
-import torch
-import math
-import os
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-class Init_generation(object):
+def load_mhd5_snapshots(data_path, time_start=250.0, time_end=300.0, dt_data=1.0):
+    """Load 5-field MHD dataset and extract training snapshots.
 
-    def __init__(self, size, L1=2 * math.pi, L2=2 * math.pi, alpha=2.5, tau=7.0, sigma=None, mean=None, boundary="periodic", device=None, dtype=torch.float64):
+    Expected format: dict with keys 'n', 'U', 'vpar', 'psi', 'Ti',
+    each of shape (B, T, Nx, Ny) in float64.
 
-        s1, s2 = size, size
-        self.s1 = s1
-        self.s2 = s2
+    Args:
+        data_path: path to .pt dataset file
+        time_start: start time for training window (seconds)
+        time_end: end time for training window (seconds)
+        dt_data: time interval between consecutive snapshots
 
-        self.mean = mean
+    Returns:
+        snapshots: (N, Nx, Ny, 5) float32 tensor, channel-last
+        metadata: dict with Nx, Ny, dt_data, n_samples, n_timesteps
+    """
+    data = torch.load(data_path, map_location='cpu', weights_only=False)
 
-        self.device = device
-        self.dtype = dtype
+    fields = [data[name] for name in FIELD_NAMES]
+    states = torch.stack(fields, dim=2)  # (B, T, 5, Nx, Ny)
 
-        if sigma is None:
-            self.sigma = 0.5 * tau**(0.5*(2*alpha - 2.0))
-        else:
-            self.sigma = sigma
+    t_start_idx = int(round(time_start / dt_data))
+    t_end_idx = int(round(time_end / dt_data))
+    states = states[:, t_start_idx:t_end_idx + 1]
 
-        const1 = (4*(math.pi**2))/(L1**2)
-        const2 = (4*(math.pi**2))/(L2**2)
+    B, T, C, Nx, Ny = states.shape
+    print(f'Loaded data: {B} samples, {T} timesteps, {C} fields, '
+          f'{Nx}x{Ny} grid, time [{time_start}, {time_end}]')
 
-        freq_list1 = torch.cat((torch.arange(start=0, end=s1//2, step=1),\
-                                torch.arange(start=-s1//2, end=0, step=1)), 0)
-        k1 = freq_list1.view(-1,1).repeat(1, s2//2 + 1).type(dtype).to(device)
+    # Flatten (B, T) -> (B*T,) and convert to channel-last float32
+    snapshots = states.reshape(B * T, C, Nx, Ny).permute(0, 2, 3, 1).float()
 
-        freq_list2 = torch.arange(start=0, end=s2//2 + 1, step=1)
+    metadata = dict(Nx=Nx, Ny=Ny, dt_data=dt_data,
+                    n_samples=B, n_timesteps=T, t_start=time_start, t_end=time_end)
+    return snapshots, metadata
 
-        k2 = freq_list2.view(1,-1).repeat(s1, 1).type(dtype).to(device)
 
-        self.sqrt_eig = s1*s2*self.sigma*((const1*k1**2 + const2*k2**2 + tau**2)**(-alpha/2.0))
-        self.sqrt_eig[0,0] = 0.0
+def load_mhd5_trajectories(data_path, time_start=250.0, time_end=300.0,
+                           dt_data=1.0):
+    """Load 5-field MHD dataset as trajectories for evaluation.
 
-    def __call__(self, N, xi=None):
-        if xi is None:
-            xi  = torch.randn(N, self.s1, self.s2//2 + 1, 2, dtype=self.dtype, device=self.device)
-        
-        xi[...,0] = self.sqrt_eig*xi [...,0]
-        xi[...,1] = self.sqrt_eig*xi [...,1]
-        
-        u = torch.fft.irfft2(torch.view_as_complex(xi), s=(self.s1, self.s2))
+    Returns:
+        trajectories: (B, T, 5, Nx, Ny) float32 tensor, channel-first
+                      (compatible with mhd_sim eval tools)
+        metadata: dict
+    """
+    data = torch.load(data_path, map_location='cpu', weights_only=False)
 
-        if self.mean is not None:
-            u += self.mean
-        
-        return u 
+    fields = [data[name] for name in FIELD_NAMES]
+    states = torch.stack(fields, dim=2)  # (B, T, 5, Nx, Ny)
 
-class Force_generation(object):
+    t_start_idx = int(round(time_start / dt_data))
+    t_end_idx = int(round(time_end / dt_data))
+    states = states[:, t_start_idx:t_end_idx + 1]
 
-    def __init__(self, size, max_frequency=4, amplitude_range=(-0.1, 0.1), device=None):
-        self.dim = 2
-        self.device = device
-        x = 2 * torch.pi * torch.linspace(0, 1 - 1/size, size, device=device)
-        y = 2 * torch.pi * torch.linspace(0, 1 - 1/size, size, device=device)
-        self.xx, self.yy = torch.meshgrid(x, y, indexing='xy')
-
-        self.u = torch.arange(1, max_frequency+1, device=device)  # 频率 u 的范围
-        self.v = torch.arange(1, max_frequency+1, device=device)  # 频率 v 的范围
-        self.frequencies = torch.cartesian_prod(self.u, self.v).float()
-
-        self.amplitude_range = amplitude_range
-        self.max_frequency = max_frequency
-
-    def __call__(self, N):
-        amplitudes_real = torch.distributions.Uniform(*self.amplitude_range).sample((N, self.frequencies.shape[0],))
-        amplitudes_real = amplitudes_real.to(self.device)
-        amplitudes_imaginary = torch.distributions.Uniform(*self.amplitude_range).sample((N, self.frequencies.shape[0],))
-        amplitudes_imaginary = amplitudes_imaginary.to(self.device)
-
-        force_real = torch.sum(
-            amplitudes_real[:, :, None, None] * torch.cos((self.frequencies[None, :, 0, None, None] * self.xx 
-                                                                      + self.frequencies[None, :, 1, None, None] * self.yy)), dim=1)
-
-        force_imaginary = torch.sum(
-            amplitudes_imaginary[:, :, None, None] * torch.sin((self.frequencies[None, :, 0, None, None] * self.xx
-                                                                     + self.frequencies[None, :, 1, None, None] * self.yy)), dim=1)
-
-        force = force_real + force_imaginary
-        force = force / self.max_frequency
-        return force
-
+    B, T, C, Nx, Ny = states.shape
+    metadata = dict(Nx=Nx, Ny=Ny, dt_data=dt_data,
+                    n_samples=B, n_timesteps=T, t_start=time_start, t_end=time_end)
+    return states.float(), metadata

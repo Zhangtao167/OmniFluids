@@ -5,7 +5,7 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 class Init_generation(object):
 
-    def __init__(self, size, L1=2 * math.pi, L2=2 * math.pi, alpha=4, tau=8.0, sigma=None, mean=None, boundary="periodic", device=None, dtype=torch.float64):
+    def __init__(self, size, L1=2 * math.pi / 0.15, L2=2 * math.pi / 0.15, alpha=4, tau=8.0, sigma=None, mean=None, boundary="periodic", device=None, dtype=torch.float64):
 
         s1, s2 = size, size
         self.s1 = s1
@@ -47,4 +47,15 @@ class Init_generation(object):
         if self.mean is not None:
             u += self.mean
         
-        return u 
+        return u
+
+
+class HW_Init_generation:
+    """双场 GRF：分别为 ζ 和 n 生成独立初值"""
+    def __init__(self, size, k0=0.15, **kwargs):
+        L = 2 * math.pi / k0
+        self.grf_zeta = Init_generation(size, L1=L, L2=L, **kwargs)
+        self.grf_n = Init_generation(size, L1=L, L2=L, **kwargs)
+
+    def __call__(self, N):
+        return self.grf_zeta(N), self.grf_n(N)
