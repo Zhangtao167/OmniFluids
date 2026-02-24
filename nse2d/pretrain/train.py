@@ -13,7 +13,7 @@ import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
-from tools import load_mhd5_snapshots, load_mhd5_trajectories
+from tools import load_mhd5_snapshots, load_mhd5_trajectories, MHD5FieldGRF
 from psm_loss import build_mhd_instance, make_mhd5_rhs_fn, compute_physics_loss
 
 FIELD_NAMES = ['n', 'U', 'vpar', 'psi', 'Ti']
@@ -196,147 +196,313 @@ def evaluate(config, net, eval_data_path, mhd, n_rollout_steps=10,
 
 
 # ---------------------------------------------------------------------------
-# Training loop
+# Training helpers
 # ---------------------------------------------------------------------------
 
-def train(config, net):
-    """Main training loop."""
-    device = config.device
-    run_tag = getattr(config, 'run_tag', config.exp_name)
-
-    print(f'Loading training data from {config.data_path}...')
+def _make_offline_loader(config):
+    """Load mhd_sim data and build DataLoader."""
     snapshots, meta = load_mhd5_snapshots(
         config.data_path,
         time_start=config.time_start,
         time_end=config.time_end,
         dt_data=config.dt_data)
-
-    eval_data_path = getattr(config, 'eval_data_path', config.data_path)
-    if eval_data_path == config.data_path:
-        print('  WARNING: eval_data_path not set, falling back to training data for evaluation!')
-    else:
-        print(f'Evaluation will use test set: {eval_data_path}')
-
     Nx, Ny = meta['Nx'], meta['Ny']
     assert Nx == config.Nx and Ny == config.Ny, \
         f'Grid mismatch: data ({Nx},{Ny}) vs config ({config.Nx},{config.Ny})'
-
     dataset = TensorDataset(snapshots)
     loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True,
                         num_workers=0, pin_memory=True, drop_last=True)
+    return loader, meta
+
+
+def _make_grf_generator(config):
+    """Build GRF random field generator."""
+    if getattr(config, 'grf_scale_from_data', 1):
+        grf = MHD5FieldGRF.from_data_stats(
+            config.data_path, Nx=config.Nx, Ny=config.Ny,
+            alpha=getattr(config, 'grf_alpha', 2.5),
+            tau=getattr(config, 'grf_tau', 7.0),
+            device=config.device,
+            time_start=config.time_start, time_end=config.time_end,
+            dt_data=config.dt_data)
+    else:
+        grf = MHD5FieldGRF(
+            Nx=config.Nx, Ny=config.Ny,
+            alpha=getattr(config, 'grf_alpha', 2.5),
+            tau=getattr(config, 'grf_tau', 7.0),
+            device=config.device)
+    return grf
+
+
+def _make_scheduler(optimizer, lr, total_steps):
+    """Create a fresh OneCycleLR scheduler."""
+    return optim.lr_scheduler.OneCycleLR(
+        optimizer, max_lr=lr, total_steps=total_steps + 1)
+
+
+class _OfflineSampler:
+    """Infinite iterator over a DataLoader, auto-resets on exhaustion."""
+    def __init__(self, loader):
+        self.loader = loader
+        self._iter = iter(loader)
+
+    def next_batch(self):
+        try:
+            (x_batch,) = next(self._iter)
+        except StopIteration:
+            self._iter = iter(self.loader)
+            (x_batch,) = next(self._iter)
+        return x_batch
+
+
+# ---------------------------------------------------------------------------
+# Unified training step
+# ---------------------------------------------------------------------------
+
+def _train_step(net, x_0, rhs_fn, optimizer, scheduler, config):
+    """Execute one training step. Returns loss value."""
+    noise_scale = getattr(config, 'input_noise_scale', 0.0)
+    if noise_scale > 0:
+        x_0 = x_0 + noise_scale * torch.randn_like(x_0)
+    pred_traj = net(x_0)
+
+    loss = compute_physics_loss(
+        pred_traj, x_0, rhs_fn,
+        rollout_dt=config.rollout_dt,
+        output_dim=config.output_dim,
+        time_integrator=config.time_integrator)
+
+    loss.backward()
+    if config.grad_clip is not None:
+        torch.nn.utils.clip_grad_norm_(net.parameters(), config.grad_clip)
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    scheduler.step()
+    return loss.item()
+
+
+# ---------------------------------------------------------------------------
+# Convergence curve (updated after each evaluation)
+# ---------------------------------------------------------------------------
+
+def _plot_convergence(eval_history, save_path):
+    """Plot mean relative L2 error vs training step."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    steps = [h['step'] for h in eval_history]
+    mean_l2 = [h['mean_rel_l2'] for h in eval_history]
+    best_idx = int(np.argmin(mean_l2))
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(steps, mean_l2, 'b-o', markersize=3, label='mean rel L2')
+    ax.plot(steps[best_idx], mean_l2[best_idx], 'r*', markersize=12,
+            label=f'best={mean_l2[best_idx]:.6f} @ step {steps[best_idx]}')
+    ax.set_xlabel('Training step')
+    ax.set_ylabel('Mean relative L2 error')
+    ax.set_title('Evaluation Convergence')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    if len(mean_l2) > 1 and max(mean_l2) / max(min(mean_l2), 1e-10) > 10:
+        ax.set_yscale('log')
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150)
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# Logging / checkpointing (shared across all modes)
+# ---------------------------------------------------------------------------
+
+def _log_and_eval(config, net, global_step, loss_val, running_loss,
+                  running_count, t_start, eval_data_path, mhd,
+                  best_loss, run_tag, source_tag, eval_history):
+    """Handle periodic logging and evaluation. Returns updated best_loss."""
+    if global_step % config.log_every == 0:
+        avg = running_loss / max(running_count, 1)
+        lr_now = net._optimizer_ref.param_groups[0]['lr']
+        elapsed = time.time() - t_start
+        it_s = global_step / max(elapsed, 1e-6)
+        eta = (config.num_iterations - global_step) / max(it_s, 1e-6)
+        print(f'[{run_tag[:8]}] step {global_step:6d}/{config.num_iterations} '
+              f'| loss {loss_val:.6f} | avg {avg:.6f} '
+              f'| lr {lr_now:.2e} | {it_s:.1f} it/s | ETA {eta/60:.0f}m '
+              f'| src={source_tag}')
+        sys.stdout.flush()
+
+    if global_step % config.eval_every == 0:
+        do_plots = (global_step % (config.eval_every * 5) == 0)
+        eval_results = evaluate(
+            config, net, eval_data_path, mhd,
+            n_rollout_steps=config.eval_rollout_steps,
+            save_plots=do_plots,
+            step_tag=f'step_{global_step}')
+
+        current_loss = eval_results['mean_rel_l2']
+        if current_loss < best_loss:
+            best_loss = current_loss
+            save_path = os.path.join(config.run_dir, 'model', f'best-{run_tag}.pt')
+            torch.save({
+                'model_state_dict': net.state_dict(),
+                'config': vars(config),
+                'step': global_step,
+                'best_loss': best_loss,
+                'eval_results': eval_results,
+            }, save_path)
+            print(f'  -> New best: {save_path} (rel_l2={best_loss:.6f})')
+
+        torch.save({
+            'model_state_dict': net.state_dict(),
+            'config': vars(config),
+            'step': global_step,
+            'best_loss': best_loss,
+        }, os.path.join(config.run_dir, 'model', f'latest-{run_tag}.pt'))
+
+        eval_history.append({'step': global_step, 'mean_rel_l2': current_loss})
+        conv_path = os.path.join(config.run_dir, 'vis', 'convergence.png')
+        _plot_convergence(eval_history, conv_path)
+
+        net.train()
+        sys.stdout.flush()
+
+    return best_loss
+
+
+# ---------------------------------------------------------------------------
+# Main training loop (supports offline / online / staged / alternating)
+# ---------------------------------------------------------------------------
+
+def train(config, net):
+    """Main training loop with multiple data modes.
+
+    data_mode:
+        offline     — train exclusively on mhd_sim pre-generated data
+        online      — train exclusively on GRF random initial conditions
+        staged      — online for online_warmup_steps, then offline for remainder
+        alternating — cycle: alternate_online_steps online, then
+                      alternate_offline_steps offline, repeat
+    """
+    device = config.device
+    run_tag = getattr(config, 'run_tag', config.exp_name)
+    data_mode = getattr(config, 'data_mode', 'offline')
+    eval_data_path = getattr(config, 'eval_data_path', config.data_path)
+
+    if eval_data_path == config.data_path:
+        print('  WARNING: eval_data_path not set, using training data for evaluation!')
+    else:
+        print(f'Evaluation will use test set: {eval_data_path}')
+
+    # --- Build components needed by each mode ---
+    offline_sampler = None
+    grf = None
+
+    need_offline = data_mode in ('offline', 'staged', 'alternating')
+    need_online = data_mode in ('online', 'staged', 'alternating')
+
+    if need_offline:
+        print(f'Loading training data from {config.data_path}...')
+        loader, meta = _make_offline_loader(config)
+        offline_sampler = _OfflineSampler(loader)
+
+    if need_online:
+        print('Building GRF generator for online data...')
+        grf = _make_grf_generator(config)
 
     print(f'Building MHD instance on {device}...')
-    mhd = build_mhd_instance(device=device, Nx=Nx, Ny=Ny)
+    mhd = build_mhd_instance(device=device, Nx=config.Nx, Ny=config.Ny)
     rhs_fn = make_mhd5_rhs_fn(mhd, model_dtype=torch.float32)
 
     net = net.to(device)
     optimizer = optim.Adam(net.parameters(), lr=config.lr,
                            weight_decay=config.weight_decay)
-    scheduler = optim.lr_scheduler.OneCycleLR(
-        optimizer, max_lr=config.lr,
-        total_steps=config.num_iterations + 1)
+    scheduler = _make_scheduler(optimizer, config.lr, config.num_iterations)
+
+    # Expose optimizer for logging helper
+    net._optimizer_ref = optimizer
 
     train_dt = config.rollout_dt / config.output_dim
     n_substeps_eval = max(1, round(config.dt_data / config.rollout_dt))
     print(f'  dt hierarchy: rollout_dt={config.rollout_dt}, '
           f'train_dt={train_dt:.4f} (output_dim={config.output_dim}), '
           f'dt_data={config.dt_data}, n_substeps_eval={n_substeps_eval}')
-
-    global_step = 0
-
+    print(f'  data_mode={data_mode}')
+    if data_mode == 'staged':
+        print(f'    online_warmup_steps={config.online_warmup_steps}')
+    elif data_mode == 'alternating':
+        print(f'    alternate: {config.alternate_online_steps} online / '
+              f'{config.alternate_offline_steps} offline per cycle')
     print(f'\n[{run_tag}] Training: {config.num_iterations} iters, '
           f'bs={config.batch_size}, lr={config.lr}')
     print('-' * 60)
     sys.stdout.flush()
 
+    # --- Initial evaluation ---
     print('Initial evaluation (step 0) ...')
     init_results = evaluate(
         config, net, eval_data_path, mhd,
         n_rollout_steps=config.eval_rollout_steps,
         save_plots=True, step_tag='step_0')
     best_loss = init_results['mean_rel_l2']
+    eval_history = [{'step': 0, 'mean_rel_l2': best_loss}]
     sys.stdout.flush()
 
     t_start = time.time()
+    global_step = 0
+    running_loss = 0.0
+    running_count = 0
 
-    for epoch in range(config.max_epochs):
+    # --- Helper: decide data source for current step ---
+    def _get_source(step):
+        if data_mode == 'offline':
+            return 'offline'
+        if data_mode == 'online':
+            return 'online'
+        if data_mode == 'staged':
+            return 'online' if step < config.online_warmup_steps else 'offline'
+        # alternating
+        cycle = config.alternate_online_steps + config.alternate_offline_steps
+        pos = step % cycle
+        return 'online' if pos < config.alternate_online_steps else 'offline'
+
+    prev_source = None
+
+    while global_step < config.num_iterations:
+        source = _get_source(global_step)
+
+        # Staged mode: reset scheduler at the transition point
+        if data_mode == 'staged' and prev_source == 'online' and source == 'offline':
+            remaining = config.num_iterations - global_step
+            scheduler = _make_scheduler(optimizer, config.lr, remaining)
+            print(f'\n[{run_tag[:8]}] === STAGED SWITCH: online -> offline at step '
+                  f'{global_step} (remaining {remaining} steps, lr scheduler reset) ===\n')
+            running_loss = 0.0
+            running_count = 0
+            sys.stdout.flush()
+        prev_source = source
+
+        if source == 'online':
+            x_0 = grf(config.batch_size)
+        else:
+            x_0 = offline_sampler.next_batch().to(device)
+
         net.train()
-        epoch_loss = 0.0
-        n_batches = 0
+        loss_val = _train_step(net, x_0, rhs_fn, optimizer, scheduler, config)
 
-        for (x_batch,) in loader:
-            if global_step > config.num_iterations:
-                break
+        running_loss += loss_val
+        running_count += 1
+        global_step += 1
 
-            x_0 = x_batch.to(device)
-            noise_scale = getattr(config, 'input_noise_scale', 0.0)
-            if noise_scale > 0:
-                x_0 = x_0 + noise_scale * torch.randn_like(x_0)
-            pred_traj = net(x_0)
+        best_loss = _log_and_eval(
+            config, net, global_step, loss_val, running_loss, running_count,
+            t_start, eval_data_path, mhd, best_loss, run_tag, source,
+            eval_history)
 
-            loss = compute_physics_loss(
-                pred_traj, x_0, rhs_fn,
-                rollout_dt=config.rollout_dt,
-                output_dim=config.output_dim,
-                time_integrator=config.time_integrator)
+        if global_step % config.log_every == 0:
+            running_loss = 0.0
+            running_count = 0
 
-            loss.backward()
-            if config.grad_clip is not None:
-                torch.nn.utils.clip_grad_norm_(net.parameters(), config.grad_clip)
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
-            scheduler.step()
-
-            epoch_loss += loss.item()
-            n_batches += 1
-            global_step += 1
-
-            if global_step % config.log_every == 0:
-                avg_loss = epoch_loss / max(n_batches, 1)
-                lr_now = optimizer.param_groups[0]['lr']
-                elapsed = time.time() - t_start
-                it_per_s = global_step / max(elapsed, 1e-6)
-                eta = (config.num_iterations - global_step) / max(it_per_s, 1e-6)
-                print(f'[{run_tag[:8]}] step {global_step:6d}/{config.num_iterations} '
-                      f'| loss {loss.item():.6f} | avg {avg_loss:.6f} '
-                      f'| lr {lr_now:.2e} | {it_per_s:.1f} it/s | ETA {eta/60:.0f}m')
-                sys.stdout.flush()
-
-            if global_step % config.eval_every == 0:
-                do_plots = (global_step % (config.eval_every * 5) == 0)
-                eval_results = evaluate(
-                    config, net, eval_data_path, mhd,
-                    n_rollout_steps=config.eval_rollout_steps,
-                    save_plots=do_plots,
-                    step_tag=f'step_{global_step}')
-
-                current_loss = eval_results['mean_rel_l2']
-                if current_loss < best_loss:
-                    best_loss = current_loss
-                    save_path = os.path.join(config.run_dir, 'model', f'best-{run_tag}.pt')
-                    torch.save({
-                        'model_state_dict': net.state_dict(),
-                        'config': vars(config),
-                        'step': global_step,
-                        'best_loss': best_loss,
-                        'eval_results': eval_results,
-                    }, save_path)
-                    print(f'  -> New best: {save_path} (rel_l2={best_loss:.6f})')
-
-                torch.save({
-                    'model_state_dict': net.state_dict(),
-                    'config': vars(config),
-                    'step': global_step,
-                    'best_loss': best_loss,
-                }, os.path.join(config.run_dir, 'model', f'latest-{run_tag}.pt'))
-
-                net.train()
-                sys.stdout.flush()
-
-        if global_step > config.num_iterations:
-            break
-
-    # Final evaluation with best model
+    # --- Final evaluation with best model ---
     best_path = os.path.join(config.run_dir, 'model', f'best-{run_tag}.pt')
     print(f'\n--- Final Evaluation [{run_tag}] ---')
     if os.path.exists(best_path):

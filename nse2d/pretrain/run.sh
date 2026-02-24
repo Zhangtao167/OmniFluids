@@ -5,20 +5,20 @@
 #   bash run.sh train      [GPU_ID] [EXP_NAME]
 #   bash run.sh inference  [GPU_ID] [CHECKPOINT_PATH] [EXP_NAME]
 #
-# dt hierarchy:
-#   rollout_dt=0.1  (= mhd_sim delta_t, model inference step)
-#   train_dt=0.01   (= rollout_dt / output_dim, physics supervision step)
-#   dt_data=1.0     (data snapshot interval)
-#   n_substeps=10   (= dt_data / rollout_dt, NFE per data step at inference)
+# To switch data mode, change DATA_MODE below:
+#   offline     — mhd_sim pre-generated data only (default)
+#   online      — GRF random initial conditions only
+#   staged      — online warmup then offline
+#   alternating — cycle online/offline
 
 set -e
 
-# Save positional arguments before conda activation (which clobbers $@)
 ARGS=("$@")
 set --
 
 source /opt/conda/bin/activate
 conda activate /zhangtao/envs/rae
+cd /zhangtao/project2026/OmniFluids/nse2d/pretrain
 
 cd "$(dirname "$0")"
 
@@ -29,19 +29,29 @@ ARG3=${ARGS[2]:-mhd5_omnifluids_v1}
 DATA_PATH="/zhangtao/project2026/OmniFluids/nse2d/data/qruio_data/5field_mhd_batch/data/5field_mhd_dataset.pt"
 EVAL_DATA_PATH="/zhangtao/project2026/OmniFluids/nse2d/data/qruio_data/5field_mhd_batch_test/data/5field_mhd_dataset.pt"
 
+# ---- Data mode config (edit here to switch) ----
+DATA_MODE="offline"
+ONLINE_WARMUP_STEPS=50000
+ALTERNATE_ONLINE_STEPS=20000
+ALTERNATE_OFFLINE_STEPS=10000
+
 if [ "$MODE" = "train" ]; then
     EXP_NAME="$ARG3"
-    echo "=== Training: $EXP_NAME on cuda:$GPU ==="
+    echo "=== Training [$DATA_MODE]: $EXP_NAME on cuda:$GPU ==="
     python main.py \
         --mode train \
         --device "cuda:$GPU" \
         --exp_name "$EXP_NAME" \
         --data_path "$DATA_PATH" \
         --eval_data_path "$EVAL_DATA_PATH" \
+        --data_mode "$DATA_MODE" \
+        --online_warmup_steps "$ONLINE_WARMUP_STEPS" \
+        --alternate_online_steps "$ALTERNATE_ONLINE_STEPS" \
+        --alternate_offline_steps "$ALTERNATE_OFFLINE_STEPS" \
         --time_start 250.0 \
         --time_end 300.0 \
         --Nx 512 --Ny 256 \
-        --modes_x 32 --modes_y 32 \
+        --modes_x 128 --modes_y 128 \
         --width 80 \
         --n_layers 12 \
         --K 4 \

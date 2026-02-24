@@ -194,6 +194,23 @@ if __name__ == "__main__":
     parser.add_argument('--max_epochs', type=int, default=10000)
     parser.add_argument('--grad_clip', type=float, default=None)
 
+    parser.add_argument('--data_mode', type=str, default='offline',
+                        choices=['offline', 'online', 'staged', 'alternating'],
+                        help='Data source: offline=mhd_sim data, online=GRF random, '
+                             'staged=online then offline, alternating=cycle both')
+    parser.add_argument('--online_warmup_steps', type=int, default=5000,
+                        help='Steps of online training before switching (staged mode)')
+    parser.add_argument('--alternate_online_steps', type=int, default=500,
+                        help='Online steps per cycle (alternating mode)')
+    parser.add_argument('--alternate_offline_steps', type=int, default=500,
+                        help='Offline steps per cycle (alternating mode)')
+    parser.add_argument('--grf_alpha', type=float, default=2.5,
+                        help='GRF spectral decay exponent')
+    parser.add_argument('--grf_tau', type=float, default=7.0,
+                        help='GRF inverse correlation length')
+    parser.add_argument('--grf_scale_from_data', type=int, default=1,
+                        help='1=derive GRF field_scales from data stats, 0=use defaults')
+
     parser.add_argument('--log_every', type=int, default=100)
     parser.add_argument('--eval_every', type=int, default=500)
     parser.add_argument('--eval_rollout_steps', type=int, default=10)
