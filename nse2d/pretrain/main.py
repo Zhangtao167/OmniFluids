@@ -10,6 +10,7 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 DATA_ROOT = '/zhangtao/project2026/OmniFluids/nse2d/data/qruio_data'
 DEFAULT_DATA = os.path.join(DATA_ROOT, '5field_mhd_batch/data/5field_mhd_dataset.pt')
+DEFAULT_EVAL_DATA = os.path.join(DATA_ROOT, '5field_mhd_batch_test/data/5field_mhd_dataset.pt')
 
 
 class TeeOutput:
@@ -47,12 +48,13 @@ def make_run_tag(cfg):
     return cfg.run_tag
 
 
-def make_dirs(cfg):
-    """Create output directories."""
-    for d in [f'log/log_{cfg.exp_name}',
-              f'model/{cfg.exp_name}',
-              f'results/{cfg.exp_name}']:
-        os.makedirs(d, exist_ok=True)
+def make_run_dir(cfg):
+    """Create per-run directory tree under results/{exp_name}/{run_tag}/."""
+    base = os.path.join('results', cfg.exp_name, cfg.run_tag)
+    cfg.run_dir = base
+    for sub in ['log', 'model', 'vis', 'inference']:
+        os.makedirs(os.path.join(base, sub), exist_ok=True)
+    return base
 
 
 def run_train(cfg):
@@ -63,9 +65,9 @@ def run_train(cfg):
 
     setup_seed(cfg.seed)
     run_tag = make_run_tag(cfg)
-    make_dirs(cfg)
+    make_run_dir(cfg)
 
-    logfile = f'log/log_{cfg.exp_name}/log-{run_tag}.csv'
+    logfile = os.path.join(cfg.run_dir, 'log', f'log-{run_tag}.txt')
     sys.stdout = TeeOutput(logfile)
 
     print('=' * 60)
@@ -124,13 +126,25 @@ def run_inference(cfg):
     Ny = saved_cfg.get('Ny', cfg.Ny)
     mhd = build_mhd_instance(device=cfg.device, Nx=Nx, Ny=Ny)
 
+    # Determine run_dir: if checkpoint is in new layout (.../model/best-xxx.pt),
+    # reuse the same per-run folder; otherwise create a sibling inference folder.
+    ckpt_model_dir = os.path.dirname(os.path.abspath(cfg.checkpoint))
+    ckpt_run_dir = os.path.dirname(ckpt_model_dir)
+    if os.path.basename(ckpt_model_dir) == 'model':
+        cfg.run_dir = ckpt_run_dir
+    else:
+        cfg.run_dir = os.path.join('results', cfg.exp_name, 'inference_run')
+    for sub in ['inference', 'vis']:
+        os.makedirs(os.path.join(cfg.run_dir, sub), exist_ok=True)
+
     print(f'Loaded checkpoint from {cfg.checkpoint} (step {ckpt.get("step", "?")})')
-    results = evaluate(cfg, net, cfg.data_path, mhd,
+    print(f'Evaluating on test set: {cfg.eval_data_path}')
+    print(f'Saving results to: {cfg.run_dir}/')
+    results = evaluate(cfg, net, cfg.eval_data_path, mhd,
                        n_rollout_steps=cfg.eval_rollout_steps,
                        save_plots=True, step_tag='inference')
 
-    os.makedirs(f'results/{cfg.exp_name}', exist_ok=True)
-    out_path = f'results/{cfg.exp_name}/inference_results.json'
+    out_path = os.path.join(cfg.run_dir, 'inference', 'inference_results.json')
     with open(out_path, 'w') as f:
         json.dump(results, f, indent=2)
     print(f'Results saved to {out_path}')
@@ -143,7 +157,10 @@ if __name__ == "__main__":
                         choices=['train', 'inference'])
     parser.add_argument('--checkpoint', type=str, default=None)
 
-    parser.add_argument('--data_path', type=str, default=DEFAULT_DATA)
+    parser.add_argument('--data_path', type=str, default=DEFAULT_DATA,
+                        help='Training data path')
+    parser.add_argument('--eval_data_path', type=str, default=DEFAULT_EVAL_DATA,
+                        help='Evaluation/test data path (separate from training)')
     parser.add_argument('--time_start', type=float, default=250.0)
     parser.add_argument('--time_end', type=float, default=300.0)
     parser.add_argument('--dt_data', type=float, default=1.0)

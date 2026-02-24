@@ -90,20 +90,20 @@ def save_eval_plots(pred_traj, gt_traj, rel_l2_total, rel_l2_per_field,
             t_phys = time_start + t * n_substeps * rollout_dt
             ic_tag = ' (IC)' if t == 0 else ''
 
-            im0 = axes[0, j].imshow(gt_snap.T, origin='lower', aspect='auto',
+            im0 = axes[0, j].imshow(gt_snap, aspect='auto',
                                     vmin=vmin, vmax=vmax, cmap='RdBu_r')
             axes[0, j].set_title(f'GT t={t_phys:.1f}s{ic_tag}', fontsize=9)
             fig.colorbar(im0, ax=axes[0, j], fraction=0.046)
             if j == 0:
-                axes[0, j].set_ylabel('y (binormal)')
+                axes[0, j].set_ylabel('x (radial)')
 
-            im1 = axes[1, j].imshow(pred_snap.T, origin='lower', aspect='auto',
+            im1 = axes[1, j].imshow(pred_snap, aspect='auto',
                                     vmin=vmin, vmax=vmax, cmap='RdBu_r')
             axes[1, j].set_title(f'Pred t={t_phys:.1f}s{ic_tag}', fontsize=9)
             fig.colorbar(im1, ax=axes[1, j], fraction=0.046)
             if j == 0:
-                axes[1, j].set_ylabel('y (binormal)')
-            axes[1, j].set_xlabel('x (radial)')
+                axes[1, j].set_ylabel('x (radial)')
+            axes[1, j].set_xlabel('y (binormal)')
 
         fig.suptitle(f'{name} ({tag})', fontsize=14)
         plt.tight_layout()
@@ -143,8 +143,8 @@ def evaluate(config, net, eval_data_path, mhd, n_rollout_steps=10,
     with torch.no_grad():
         for _data_step in range(n_steps):
             for _sub in range(n_substeps):
-                out = net(current, inference=True)
-                current = out[..., -1]
+                out = net(current, inference=True) # (B, Nx, Ny, 5,Tp)
+                current = out[..., -1] # (B, Nx, Ny, 5)
             pred_cf = current.permute(0, 3, 1, 2).unsqueeze(1)
             pred_list.append(pred_cf)
 
@@ -181,8 +181,10 @@ def evaluate(config, net, eval_data_path, mhd, n_rollout_steps=10,
         print(f'    step {t+1}: total={rel_l2_total[t]:.6f} | {fields_str}')
 
     if save_plots:
-        run_tag = getattr(config, 'run_tag', config.exp_name)
-        vis_dir = f'results/{config.exp_name}/vis_{run_tag}'
+        run_dir = getattr(config, 'run_dir',
+                          os.path.join('results', config.exp_name,
+                                       getattr(config, 'run_tag', config.exp_name)))
+        vis_dir = os.path.join(run_dir, 'vis')
         save_eval_plots(pred_traj, gt, rel_l2_total, rel_l2_per_field,
                         vis_dir, tag=step_tag,
                         time_start=config.time_start,
@@ -209,6 +211,12 @@ def train(config, net):
         time_end=config.time_end,
         dt_data=config.dt_data)
 
+    eval_data_path = getattr(config, 'eval_data_path', config.data_path)
+    if eval_data_path == config.data_path:
+        print('  WARNING: eval_data_path not set, falling back to training data for evaluation!')
+    else:
+        print(f'Evaluation will use test set: {eval_data_path}')
+
     Nx, Ny = meta['Nx'], meta['Ny']
     assert Nx == config.Nx and Ny == config.Ny, \
         f'Grid mismatch: data ({Nx},{Ny}) vs config ({config.Nx},{config.Ny})'
@@ -234,12 +242,19 @@ def train(config, net):
           f'train_dt={train_dt:.4f} (output_dim={config.output_dim}), '
           f'dt_data={config.dt_data}, n_substeps_eval={n_substeps_eval}')
 
-    best_loss = float('inf')
     global_step = 0
 
     print(f'\n[{run_tag}] Training: {config.num_iterations} iters, '
           f'bs={config.batch_size}, lr={config.lr}')
     print('-' * 60)
+    sys.stdout.flush()
+
+    print('Initial evaluation (step 0) ...')
+    init_results = evaluate(
+        config, net, eval_data_path, mhd,
+        n_rollout_steps=config.eval_rollout_steps,
+        save_plots=True, step_tag='step_0')
+    best_loss = init_results['mean_rel_l2']
     sys.stdout.flush()
 
     t_start = time.time()
@@ -290,7 +305,7 @@ def train(config, net):
             if global_step % config.eval_every == 0:
                 do_plots = (global_step % (config.eval_every * 5) == 0)
                 eval_results = evaluate(
-                    config, net, config.data_path, mhd,
+                    config, net, eval_data_path, mhd,
                     n_rollout_steps=config.eval_rollout_steps,
                     save_plots=do_plots,
                     step_tag=f'step_{global_step}')
@@ -298,7 +313,7 @@ def train(config, net):
                 current_loss = eval_results['mean_rel_l2']
                 if current_loss < best_loss:
                     best_loss = current_loss
-                    save_path = f'model/{config.exp_name}/best-{run_tag}.pt'
+                    save_path = os.path.join(config.run_dir, 'model', f'best-{run_tag}.pt')
                     torch.save({
                         'model_state_dict': net.state_dict(),
                         'config': vars(config),
@@ -313,7 +328,7 @@ def train(config, net):
                     'config': vars(config),
                     'step': global_step,
                     'best_loss': best_loss,
-                }, f'model/{config.exp_name}/latest-{run_tag}.pt')
+                }, os.path.join(config.run_dir, 'model', f'latest-{run_tag}.pt'))
 
                 net.train()
                 sys.stdout.flush()
@@ -322,7 +337,7 @@ def train(config, net):
             break
 
     # Final evaluation with best model
-    best_path = f'model/{config.exp_name}/best-{run_tag}.pt'
+    best_path = os.path.join(config.run_dir, 'model', f'best-{run_tag}.pt')
     print(f'\n--- Final Evaluation [{run_tag}] ---')
     if os.path.exists(best_path):
         net.load_state_dict(
@@ -332,11 +347,11 @@ def train(config, net):
         print(f'  WARNING: best checkpoint not found at {best_path}, using latest weights')
 
     final_results = evaluate(
-        config, net, config.data_path, mhd,
+        config, net, eval_data_path, mhd,
         n_rollout_steps=config.eval_rollout_steps,
         save_plots=True, step_tag=f'final-{run_tag}')
 
-    results_path = f'results/{config.exp_name}/eval-{run_tag}.json'
+    results_path = os.path.join(config.run_dir, f'eval-{run_tag}.json')
     with open(results_path, 'w') as f:
         json.dump(final_results, f, indent=2)
     print(f'Results saved to {results_path}')

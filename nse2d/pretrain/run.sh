@@ -27,6 +27,7 @@ GPU=${ARGS[1]:-0}
 ARG3=${ARGS[2]:-mhd5_omnifluids_v1}
 
 DATA_PATH="/zhangtao/project2026/OmniFluids/nse2d/data/qruio_data/5field_mhd_batch/data/5field_mhd_dataset.pt"
+EVAL_DATA_PATH="/zhangtao/project2026/OmniFluids/nse2d/data/qruio_data/5field_mhd_batch_test/data/5field_mhd_dataset.pt"
 
 if [ "$MODE" = "train" ]; then
     EXP_NAME="$ARG3"
@@ -36,6 +37,7 @@ if [ "$MODE" = "train" ]; then
         --device "cuda:$GPU" \
         --exp_name "$EXP_NAME" \
         --data_path "$DATA_PATH" \
+        --eval_data_path "$EVAL_DATA_PATH" \
         --time_start 250.0 \
         --time_end 300.0 \
         --Nx 512 --Ny 256 \
@@ -64,6 +66,7 @@ elif [ "$MODE" = "inference" ]; then
         --device "cuda:$GPU" \
         --checkpoint "$CKPT" \
         --data_path "$DATA_PATH" \
+        --eval_data_path "$EVAL_DATA_PATH" \
         --time_start 250.0 \
         --time_end 300.0 \
         --rollout_dt 0.1 \
