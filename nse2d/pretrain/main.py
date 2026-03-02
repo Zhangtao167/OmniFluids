@@ -186,6 +186,8 @@ if __name__ == "__main__":
                         choices=['euler', 'crank_nicolson'])
     parser.add_argument('--input_noise_scale', type=float, default=0.001,
                         help='Scale of additive Gaussian noise on training input')
+    parser.add_argument('--mae_weight', type=float, default=0.0,
+                        help='Weight for MAE loss term (0=off, e.g. 0.1)')
 
     parser.add_argument('--lr', type=float, default=0.002)
     parser.add_argument('--weight_decay', type=float, default=0.0)
@@ -204,12 +206,16 @@ if __name__ == "__main__":
                         help='Online steps per cycle (alternating mode)')
     parser.add_argument('--alternate_offline_steps', type=int, default=500,
                         help='Offline steps per cycle (alternating mode)')
-    parser.add_argument('--grf_alpha', type=float, default=2.5,
-                        help='GRF spectral decay exponent')
-    parser.add_argument('--grf_tau', type=float, default=7.0,
-                        help='GRF inverse correlation length')
+    parser.add_argument('--grf_alpha', type=float, default=None,
+                        help='GRF spectral decay exponent (None=per-field defaults)')
+    parser.add_argument('--grf_tau', type=float, default=None,
+                        help='GRF inverse correlation length (None=per-field defaults)')
     parser.add_argument('--grf_scale_from_data', type=int, default=1,
                         help='1=derive GRF field_scales from data stats, 0=use defaults')
+    parser.add_argument('--grf_use_radial_mask', type=int, default=1,
+                        help='1=use radial mask for GRF (default), 0=disable (full Dirichlet)')
+    parser.add_argument('--grf_use_abs_constraint', type=int, default=1,
+                        help='1=apply abs() to n and Ti for positivity (default), 0=disable')
 
     parser.add_argument('--log_every', type=int, default=100)
     parser.add_argument('--eval_every', type=int, default=500)

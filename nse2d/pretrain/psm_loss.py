@@ -47,13 +47,15 @@ def build_mhd_instance(device='cpu', Nx=512, Ny=256):
 
 
 def compute_physics_loss(pred_traj, x_0, rhs_fn, rollout_dt, output_dim,
-                         time_integrator='crank_nicolson'):
+                         time_integrator='crank_nicolson', mae_weight=0.0):
     """Multi-frame physics loss using mhd_sim's RHS.
 
     For each consecutive frame pair in the trajectory, enforce:
         (state[t+1] - state[t]) / dt ≈ target_rhs
 
     where target_rhs depends on the time integrator.
+
+    Total loss = MSE + mae_weight * MAE  (per-frame averaged).
 
     Args:
         pred_traj: (B, Nx, Ny, 5, output_dim) multi-frame model output
@@ -62,14 +64,16 @@ def compute_physics_loss(pred_traj, x_0, rhs_fn, rollout_dt, output_dim,
         rollout_dt: total time span covered by output_dim frames
         output_dim: number of predicted frames
         time_integrator: 'euler' or 'crank_nicolson'
+        mae_weight: weight for the additional MAE loss term (default 0 = off)
 
     Returns:
-        scalar loss (MSE between time derivative and RHS)
+        scalar loss
     """
     dt = rollout_dt / output_dim
     full_traj = torch.cat([x_0.unsqueeze(-1), pred_traj], dim=-1)
 
-    total_loss = torch.tensor(0.0, device=x_0.device, dtype=x_0.dtype)
+    total_mse = torch.tensor(0.0, device=x_0.device, dtype=x_0.dtype)
+    total_mae = torch.tensor(0.0, device=x_0.device, dtype=x_0.dtype)
 
     for t in range(output_dim):
         state_t = full_traj[..., t]
@@ -83,6 +87,12 @@ def compute_physics_loss(pred_traj, x_0, rhs_fn, rollout_dt, output_dim,
         else:
             raise ValueError(f"Unknown integrator: {time_integrator}")
 
-        total_loss = total_loss + F.mse_loss(time_diff, target.detach())
+        target = target.detach()
+        total_mse = total_mse + F.mse_loss(time_diff, target)
+        if mae_weight > 0:
+            total_mae = total_mae + F.l1_loss(time_diff, target)
 
-    return total_loss / output_dim
+    loss = total_mse / output_dim
+    if mae_weight > 0:
+        loss = loss + mae_weight * (total_mae / output_dim)
+    return loss

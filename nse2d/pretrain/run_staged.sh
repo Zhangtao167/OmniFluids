@@ -30,7 +30,7 @@ DATA_PATH="/zhangtao/project2026/OmniFluids/nse2d/data/qruio_data/5field_mhd_bat
 EVAL_DATA_PATH="/zhangtao/project2026/OmniFluids/nse2d/data/qruio_data/5field_mhd_batch_test/data/5field_mhd_dataset.pt"
 
 # ---- Data mode config (edit here to switch) ----
-DATA_MODE="offline"
+DATA_MODE="staged"
 ONLINE_WARMUP_STEPS=50000
 ALTERNATE_ONLINE_STEPS=20000
 ALTERNATE_OFFLINE_STEPS=10000
@@ -58,14 +58,14 @@ if [ "$MODE" = "train" ]; then
         --output_dim 10 \
         --rollout_dt 0.1 \
         --time_integrator crank_nicolson \
-        --input_noise_scale 0.0 \
+        --input_noise_scale 0.001 \
         --lr 0.002 \
         --batch_size 8 \
         --num_iterations 200000 \
         --log_every 100 \
         --eval_every 500 \
         --eval_rollout_steps 10 \
-        --seed 0
+        --seed 1
 
 elif [ "$MODE" = "inference" ]; then
     CKPT="$ARG3"
