@@ -2,7 +2,7 @@
 set -e
 ARGS=("$@"); set --
 source /opt/conda/bin/activate
-conda activate /zhangtao/envs/rae
+conda activate /zhangtao/envs/rae || true
 cd "$(dirname "$0")"
 
 CKPT=${ARGS[0]:-"results/mhd5_omnifluids_v1/d10ea74a-02_24_07_51_41-K4-mx128-w80-L12-od10/model/best-d10ea74a-02_24_07_51_41-K4-mx128-w80-L12-od10.pt"}

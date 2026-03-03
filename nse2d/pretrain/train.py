@@ -10,10 +10,11 @@ import json
 import time
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
-from tools import load_mhd5_snapshots, load_mhd5_trajectories, MHD5FieldGRF
+from tools import load_mhd5_snapshots, load_mhd5_trajectories, MHD5FieldGRF, FixedGRFDataSampler
 from psm_loss import build_mhd_instance, make_mhd5_rhs_fn, compute_physics_loss
 
 FIELD_NAMES = ['n', 'U', 'vpar', 'psi', 'Ti']
@@ -277,23 +278,244 @@ def evaluate(config, net, eval_data, mhd, n_rollout_steps=10,
 
 
 # ---------------------------------------------------------------------------
+# GRF Overfitting Evaluation (uses physics loss instead of trajectory L2)
+# ---------------------------------------------------------------------------
+
+def evaluate_grf_overfitting(config, net, grf_data, rhs_fn, step_tag='eval', n_eval_batches=4):
+    """Evaluate on fixed GRF data using physics loss (no ground truth trajectory).
+    
+    For GRF overfitting test, we don't have a "true" trajectory to compare against.
+    Instead, we measure the PDE residual (physics loss) as the evaluation metric.
+    
+    Args:
+        grf_data: (B, Nx, Ny, 5) fixed GRF initial conditions
+        rhs_fn: physics RHS function
+        step_tag: tag for logging
+        n_eval_batches: number of batches to average over (for more stable evaluation)
+    """
+    device = config.device
+    net.eval()
+    
+    x_all = grf_data.to(device)
+    B_total = x_all.shape[0]
+    batch_size = max(1, B_total // n_eval_batches)
+    
+    phys_losses = []
+    field_rms_all = {name: [] for name in FIELD_NAMES}
+    
+    with torch.no_grad():
+        # Multi-batch evaluation for more stable metrics
+        for i in range(0, B_total, batch_size):
+            x_0 = x_all[i:i+batch_size]
+            if x_0.shape[0] == 0:
+                continue
+            
+            pred_traj = net(x_0)  # (B, Nx, Ny, 5, output_dim)
+            
+            # Compute physics loss as evaluation metric
+            phys_loss = compute_physics_loss(
+                pred_traj, x_0, rhs_fn,
+                rollout_dt=config.rollout_dt,
+                output_dim=config.output_dim,
+                time_integrator=config.time_integrator,
+                mae_weight=0.0)
+            phys_losses.append(phys_loss.item())
+            
+            # Per-field RMS of predictions
+            pred_last = pred_traj[..., -1]  # (B, Nx, Ny, 5)
+            for c, name in enumerate(FIELD_NAMES):
+                field_rms_all[name].append(pred_last[..., c].pow(2).mean().sqrt().item())
+    
+    # Average over batches
+    avg_phys_loss = sum(phys_losses) / len(phys_losses) if phys_losses else 0.0
+    field_rms = {name: sum(vals) / len(vals) if vals else 0.0 
+                 for name, vals in field_rms_all.items()}
+    
+    results = {
+        'physics_loss': avg_phys_loss,
+        'mean_rel_l2': avg_phys_loss,  # For compatibility with convergence plotting
+        'field_rms': field_rms,
+        'n_steps': 1,
+        'n_substeps': config.output_dim,
+        'n_eval_batches': len(phys_losses),
+        'eval_type': 'grf_physics_loss',  # Explicitly mark evaluation type
+        'is_grf_eval': True,
+    }
+    
+    print(f'  [GRF Overfit Eval] physics_loss = {avg_phys_loss:.6f} (avg over {len(phys_losses)} batches)')
+    print(f'    Field RMS: ' + ' | '.join(f'{k}={v:.4f}' for k, v in field_rms.items()))
+
+    # --- Snapshot visualization: input GRF + predicted output ---
+    if getattr(config, 'run_dir', None):
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+
+            vis_dir = os.path.join(config.run_dir, 'vis')
+            os.makedirs(vis_dir, exist_ok=True)
+
+            # Use first sample for visualization
+            x_in = x_all[0].cpu()   # (Nx, Ny, 5) GRF input
+            with torch.no_grad():
+                pred_single = net(x_all[:1].to(device))   # (1, Nx, Ny, 5, T)
+            x_pred = pred_single[0, ..., -1].cpu()        # (Nx, Ny, 5) last predicted frame
+
+            fig, axes = plt.subplots(2, len(FIELD_NAMES), figsize=(18, 6))
+            row_labels = ['GRF Input', f'Pred (+{config.output_dim * config.rollout_dt:.1f}s)']
+            for row, (label, snap) in enumerate(zip(row_labels, [x_in, x_pred])):
+                for col, fname in enumerate(FIELD_NAMES):
+                    im = axes[row, col].imshow(
+                        snap[:, :, col].numpy().T,
+                        origin='lower', aspect='auto', cmap='RdBu_r')
+                    if row == 0:
+                        axes[row, col].set_title(fname)
+                    if col == 0:
+                        axes[row, col].set_ylabel(label)
+                    plt.colorbar(im, ax=axes[row, col], fraction=0.046)
+            fig.suptitle(f'GRF Overfit [{step_tag}]  physics_loss={avg_phys_loss:.4f}', fontsize=12)
+            plt.tight_layout()
+            out_path = os.path.join(vis_dir, f'grf_snapshot_{step_tag}.png')
+            fig.savefig(out_path, dpi=100, bbox_inches='tight')
+            plt.close(fig)
+            print(f'  Snapshot saved: {out_path}')
+        except Exception as e:
+            print(f'  [WARNING] GRF snapshot plot failed: {e}')
+
+    net.train()
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Training helpers
 # ---------------------------------------------------------------------------
 
 def _make_offline_loader(config):
     """Load mhd_sim data and build DataLoader."""
+    is_overfitting = bool(getattr(config, 'is_overfitting_test', 0))
+    traj_idx = getattr(config, 'overfitting_traj_idx', 0)
+    
     snapshots, meta = load_mhd5_snapshots(
         config.data_path,
         time_start=config.time_start,
         time_end=config.time_end,
-        dt_data=config.dt_data)
+        dt_data=config.dt_data,
+        single_trajectory=is_overfitting,
+        traj_idx=traj_idx)
     Nx, Ny = meta['Nx'], meta['Ny']
     assert Nx == config.Nx and Ny == config.Ny, \
         f'Grid mismatch: data ({Nx},{Ny}) vs config ({config.Nx},{config.Ny})'
     dataset = TensorDataset(snapshots)
-    loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True,
-                        num_workers=0, pin_memory=True, drop_last=True)
+    
+    # For overfitting test: keep batch_size unchanged, randomly sample from available snapshots
+    if is_overfitting:
+        # Use same batch_size, sample with replacement if dataset is smaller than batch_size
+        n_samples = len(dataset)
+        # Calculate total samples needed for all iterations
+        total_iters = getattr(config, 'num_iterations', 10000)
+        num_samples_needed = config.batch_size * total_iters
+        print(f'[OVERFITTING TEST] Dataset size: {n_samples}, batch_size={config.batch_size}, '
+              f'num_iterations={total_iters} (random sampling with replacement)')
+        # RandomSampler with replacement allows sampling more than dataset size
+        from torch.utils.data import RandomSampler
+        sampler = RandomSampler(dataset, replacement=True, num_samples=num_samples_needed)
+        loader = DataLoader(dataset, batch_size=config.batch_size, sampler=sampler,
+                            num_workers=0, pin_memory=True, drop_last=True)
+    else:
+        loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True,
+                            num_workers=0, pin_memory=True, drop_last=True)
     return loader, meta
+
+
+def _load_supervised_pairs(config):
+    """Load mhd_sim data as (x_t, x_{t+1}) pairs for supervised training.
+    
+    Returns:
+        pairs: list of (x_current, x_next) tuples
+        meta: dict with metadata
+    """
+    is_overfitting = bool(getattr(config, 'is_overfitting_test', 0))
+    traj_idx = getattr(config, 'overfitting_traj_idx', 0)
+    
+    # Use mmap=True to avoid loading entire file into RAM
+    print(f'  Loading supervised pairs (mmap) ...', end=' ', flush=True)
+    data = torch.load(config.data_path, map_location='cpu', weights_only=False, mmap=True)
+    
+    # Calculate time indices FIRST, then only clone the needed slice
+    t_start_idx = int(round(config.time_start / config.dt_data))
+    t_end_idx = int(round(config.time_end / config.dt_data))
+    
+    # Clone ONLY the slice we need (not the full tensor) - this is the key to mmap efficiency
+    fields = [data[name][:, t_start_idx:t_end_idx + 1].clone() for name in FIELD_NAMES]
+    del data
+    print('done.', flush=True)
+    states = torch.stack(fields, dim=2)  # (B, T_slice, 5, Nx, Ny)
+    
+    B, T, C, Nx, Ny = states.shape
+    
+    # For overfitting test: use only one trajectory
+    if is_overfitting:
+        if traj_idx >= B:
+            traj_idx = 0
+        states = states[traj_idx:traj_idx+1]  # (1, T, 5, Nx, Ny)
+        B = 1
+        print(f'[OVERFITTING TEST] Loading supervised pairs from trajectory #{traj_idx}: {T} timesteps, {C} fields, {Nx}x{Ny}')
+    else:
+        print(f'Loading supervised pairs: {B} trajectories, {T} timesteps, {C} fields, {Nx}x{Ny}')
+    
+    # Create (x_t, x_{t+1}) pairs from consecutive timesteps
+    pairs = []
+    for b in range(B):
+        for t in range(T - 1):  # T-1 pairs per trajectory
+            x_current = states[b, t].permute(1, 2, 0).float()  # (Nx, Ny, 5)
+            x_next = states[b, t + 1].permute(1, 2, 0).float()  # (Nx, Ny, 5)
+            pairs.append((x_current, x_next))
+    
+    meta = dict(Nx=Nx, Ny=Ny, n_pairs=len(pairs))
+    print(f'Created {len(pairs)} supervised (x_t, x_{{t+1}}) pairs')
+    return pairs, meta
+
+
+class _SupervisedOfflineSampler:
+    """Infinite iterator over supervised pairs, auto-resets on exhaustion."""
+    def __init__(self, pairs, batch_size, device='cpu', is_overfitting=False):
+        self.pairs = pairs
+        self.device = device
+        self.n_pairs = len(pairs)
+        self.batch_size = batch_size  # Keep batch_size unchanged
+        self.is_overfitting = is_overfitting
+        if is_overfitting:
+            print(f'[OVERFITTING TEST] Supervised sampler: {self.n_pairs} pairs, '
+                  f'batch_size={batch_size} (random sampling with replacement)')
+        self._shuffle()
+        self._idx = 0
+    
+    def _shuffle(self):
+        import random
+        random.shuffle(self.pairs)
+    
+    def next_batch(self):
+        """Returns (x_0_batch, x_target_batch)"""
+        import random
+        
+        if self.is_overfitting:
+            # For overfitting: randomly sample with replacement to fill batch_size
+            batch_pairs = random.choices(self.pairs, k=self.batch_size)
+        else:
+            # Normal mode: sequential with shuffle on epoch end
+            if self._idx + self.batch_size > self.n_pairs:
+                self._shuffle()
+                self._idx = 0
+            batch_pairs = self.pairs[self._idx:self._idx + self.batch_size]
+            self._idx += self.batch_size
+        
+        x_0_list = [p[0] for p in batch_pairs]
+        x_target_list = [p[1] for p in batch_pairs]
+        
+        x_0 = torch.stack(x_0_list).to(self.device)
+        x_target = torch.stack(x_target_list).to(self.device)
+        
+        return x_0, x_target
 
 
 def _make_grf_generator(config):
@@ -302,7 +524,6 @@ def _make_grf_generator(config):
     alpha = getattr(config, 'grf_alpha', None)
     tau = getattr(config, 'grf_tau', None)
     use_radial_mask = bool(getattr(config, 'grf_use_radial_mask', 1))
-    use_abs_constraint = bool(getattr(config, 'grf_use_abs_constraint', 1))
     if getattr(config, 'grf_scale_from_data', 1):
         grf = MHD5FieldGRF.from_data_stats(
             config.data_path, Nx=config.Nx, Ny=config.Ny,
@@ -310,15 +531,13 @@ def _make_grf_generator(config):
             device=config.device,
             time_start=config.time_start, time_end=config.time_end,
             dt_data=config.dt_data,
-            use_radial_mask=use_radial_mask,
-            use_abs_constraint=use_abs_constraint)
+            use_radial_mask=use_radial_mask)
     else:
         grf = MHD5FieldGRF(
             Nx=config.Nx, Ny=config.Ny,
             alpha=alpha, tau=tau,
             device=config.device,
-            use_radial_mask=use_radial_mask,
-            use_abs_constraint=use_abs_constraint)
+            use_radial_mask=use_radial_mask)
     return grf
 
 
@@ -344,38 +563,94 @@ class _OfflineSampler:
 
 
 # ---------------------------------------------------------------------------
+# Supervised loss computation
+# ---------------------------------------------------------------------------
+
+def _compute_supervised_loss(pred, target, mse_weight=1.0, mae_weight=0.0):
+    """Compute supervised MSE and MAE loss between prediction and target.
+    
+    Args:
+        pred: (B, Nx, Ny, 5) predicted state
+        target: (B, Nx, Ny, 5) target state
+        mse_weight: weight for MSE term
+        mae_weight: weight for MAE term
+    
+    Returns:
+        loss: combined loss value
+        metrics: dict with mse, mae components
+    """
+    mse = F.mse_loss(pred, target)
+    mae = F.l1_loss(pred, target)
+    loss = mse_weight * mse + mae_weight * mae
+    return loss, {'mse': mse.item(), 'mae': mae.item()}
+
+
+# ---------------------------------------------------------------------------
 # Unified training step
 # ---------------------------------------------------------------------------
 
-def _train_step(net, x_0, rhs_fn, optimizer, scheduler, config):
-    """Execute one training step. Returns loss value."""
+def _train_step(net, x_0, rhs_fn, optimizer, scheduler, config, x_target=None):
+    """Execute one training step. Returns loss value.
+    
+    Args:
+        x_target: Optional target state for supervised loss. If provided,
+                  computes MSE/MAE between pred[..., -1] and x_target.
+    """
     noise_scale = getattr(config, 'input_noise_scale', 0.0)
     if noise_scale > 0:
         x_0 = x_0 + noise_scale * torch.randn_like(x_0)
     pred_traj = net(x_0)
 
-    loss = compute_physics_loss(
-        pred_traj, x_0, rhs_fn,
-        rollout_dt=config.rollout_dt,
-        output_dim=config.output_dim,
-        time_integrator=config.time_integrator,
-        mae_weight=getattr(config, 'mae_weight', 0.0))
+    # Physics loss (PDE loss)
+    phys_loss_weight = getattr(config, 'physics_loss_weight', 1.0)
+    if phys_loss_weight > 0:
+        phys_loss = compute_physics_loss(
+            pred_traj, x_0, rhs_fn,
+            rollout_dt=config.rollout_dt,
+            output_dim=config.output_dim,
+            time_integrator=config.time_integrator,
+            mae_weight=getattr(config, 'mae_weight', 0.0))
+        total_loss = phys_loss_weight * phys_loss
+        loss_components = {'phys': phys_loss.item()}
+    else:
+        total_loss = torch.tensor(0.0, device=pred_traj.device, dtype=pred_traj.dtype)
+        loss_components = {'phys': 0.0}
+    
+    # Supervised loss (only when target is provided)
+    if x_target is not None:
+        # Use the last predicted frame as the next state prediction
+        pred_next = pred_traj[..., -1]  # (B, Nx, Ny, 5)
+        
+        sup_weight = getattr(config, 'supervised_loss_weight', 0.0)
+        sup_mse_weight = getattr(config, 'supervised_mse_weight', 1.0)
+        sup_mae_weight = getattr(config, 'supervised_mae_weight', 0.0)
+        
+        if sup_weight > 0:
+            sup_loss, sup_metrics = _compute_supervised_loss(
+                pred_next, x_target, 
+                mse_weight=sup_mse_weight,
+                mae_weight=sup_mae_weight)
+            total_loss = total_loss + sup_weight * sup_loss
+            loss_components['sup'] = sup_loss.item()
+            loss_components['sup_mse'] = sup_metrics['mse']
+            loss_components['sup_mae'] = sup_metrics['mae']
 
-    loss.backward()
+    total_loss.backward()
     if config.grad_clip is not None:
         torch.nn.utils.clip_grad_norm_(net.parameters(), config.grad_clip)
     optimizer.step()
     optimizer.zero_grad(set_to_none=True)
     scheduler.step()
-    return loss.item()
+    
+    return total_loss.item()
 
 
 # ---------------------------------------------------------------------------
 # Convergence curve (updated after each evaluation)
 # ---------------------------------------------------------------------------
 
-def _plot_convergence(eval_history, save_path):
-    """Plot mean relative L2 error and training loss vs training step."""
+def _plot_convergence(eval_history, save_path, train_loss_history=None):
+    """Plot evaluation and training loss vs training step."""
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
@@ -384,36 +659,31 @@ def _plot_convergence(eval_history, save_path):
     mean_l2 = [h['mean_rel_l2'] for h in eval_history]
     best_idx = int(np.argmin(mean_l2))
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig, ax = plt.subplots(figsize=(10, 5))
     
-    # Plot 1: Evaluation relative L2 error
-    ax1 = axes[0]
-    ax1.plot(steps, mean_l2, 'b-o', markersize=3, label='mean rel L2')
-    ax1.plot(steps[best_idx], mean_l2[best_idx], 'r*', markersize=12,
+    # Plot evaluation loss
+    ax.plot(steps, mean_l2, 'b-o', markersize=3, label='eval loss')
+    ax.plot(steps[best_idx], mean_l2[best_idx], 'r*', markersize=12,
             label=f'best={mean_l2[best_idx]:.6f} @ step {steps[best_idx]}')
-    ax1.set_xlabel('Training step')
-    ax1.set_ylabel('Mean relative L2 error')
-    ax1.set_title('Evaluation Convergence')
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
-    if len(mean_l2) > 1 and max(mean_l2) / max(min(mean_l2), 1e-10) > 10:
-        ax1.set_yscale('log')
     
-    # Plot 2: Training loss
-    ax2 = axes[1]
-    if 'train_loss' in eval_history[0]:
-        train_losses = [h.get('train_loss', float('nan')) for h in eval_history]
-        ax2.plot(steps, train_losses, 'g-s', markersize=3, label='training loss')
-        ax2.set_xlabel('Training step')
-        ax2.set_ylabel('Training loss')
-        ax2.set_title('Training Loss Curve')
-        ax2.legend()
-        ax2.grid(True, alpha=0.3)
-        if len(train_losses) > 1 and max(train_losses) / max(min(train_losses), 1e-10) > 10:
-            ax2.set_yscale('log')
-    else:
-        ax2.text(0.5, 0.5, 'No training loss data', ha='center', va='center', transform=ax2.transAxes)
-        ax2.set_title('Training Loss (not available)')
+    # Plot training loss if available
+    if train_loss_history and len(train_loss_history) > 0:
+        train_steps = [h['step'] for h in train_loss_history]
+        train_loss = [h['train_loss'] for h in train_loss_history]
+        ax.plot(train_steps, train_loss, 'g-', alpha=0.6, linewidth=1, label='train loss (avg)')
+    
+    ax.set_xlabel('Training step')
+    ax.set_ylabel('Loss')
+    ax.set_title('Training & Evaluation Convergence')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    # Use log scale if loss varies significantly
+    all_values = mean_l2[:]
+    if train_loss_history:
+        all_values.extend([h['train_loss'] for h in train_loss_history])
+    if len(all_values) > 1 and max(all_values) / max(min(all_values), 1e-10) > 10:
+        ax.set_yscale('log')
     
     plt.tight_layout()
     plt.savefig(save_path, dpi=150)
@@ -426,8 +696,15 @@ def _plot_convergence(eval_history, save_path):
 
 def _log_and_eval(config, net, global_step, loss_val, running_loss,
                   running_count, t_start, eval_data, mhd,
-                  best_loss, run_tag, source_tag, eval_history):
-    """Handle periodic logging and evaluation. Returns updated best_loss."""
+                  best_loss, run_tag, source_tag, eval_history,
+                  train_loss_history=None):
+    """Handle periodic logging and evaluation. Returns updated best_loss.
+    
+    Evaluation always uses mhd_sim test set for fair comparison, regardless of training data source.
+    
+    Args:
+        train_loss_history: list to append training loss for convergence plot
+    """
     if global_step % config.log_every == 0:
         avg = running_loss / max(running_count, 1)
         lr_now = net._optimizer_ref.param_groups[0]['lr']
@@ -439,9 +716,15 @@ def _log_and_eval(config, net, global_step, loss_val, running_loss,
               f'| lr {lr_now:.2e} | {it_s:.1f} it/s | ETA {eta/60:.0f}m '
               f'| src={source_tag}')
         sys.stdout.flush()
+        
+        # Record training loss for convergence plot
+        if train_loss_history is not None:
+            train_loss_history.append({'step': global_step, 'train_loss': avg})
 
     if global_step % config.eval_every == 0:
         do_plots = (global_step % (config.eval_every * 5) == 0)
+        
+        # Always use mhd_sim test set for fair comparison
         eval_results = evaluate(
             config, net, eval_data, mhd,
             n_rollout_steps=config.eval_rollout_steps,
@@ -459,7 +742,7 @@ def _log_and_eval(config, net, global_step, loss_val, running_loss,
                 'best_loss': best_loss,
                 'eval_results': eval_results,
             }, save_path)
-            print(f'  -> New best: {save_path} (rel_l2={best_loss:.6f})')
+            print(f'  -> New best: {save_path} (loss={best_loss:.6f})')
 
         torch.save({
             'model_state_dict': net.state_dict(),
@@ -468,11 +751,9 @@ def _log_and_eval(config, net, global_step, loss_val, running_loss,
             'best_loss': best_loss,
         }, os.path.join(config.run_dir, 'model', f'latest-{run_tag}.pt'))
 
-        # Record training loss (average since last eval)
-        avg_train_loss = running_loss / max(running_count, 1) if running_count > 0 else float('nan')
-        eval_history.append({'step': global_step, 'mean_rel_l2': current_loss, 'train_loss': avg_train_loss})
+        eval_history.append({'step': global_step, 'mean_rel_l2': current_loss})
         conv_path = os.path.join(config.run_dir, 'vis', 'convergence.png')
-        _plot_convergence(eval_history, conv_path)
+        _plot_convergence(eval_history, conv_path, train_loss_history)
 
         net.train()
         sys.stdout.flush()
@@ -504,27 +785,71 @@ def train(config, net):
     else:
         print(f'Evaluation will use test set: {eval_data_path}')
 
+    # Training data overfitting flags
+    is_sim_overfitting = bool(getattr(config, 'is_overfitting_test', 0))  # Simulation data overfitting
+    overfitting_traj_idx = getattr(config, 'overfitting_traj_idx', 0)
+
     # Pre-load eval data once to avoid repeated disk I/O
-    print(f'Pre-loading evaluation data...')
-    eval_data, eval_meta = load_mhd5_trajectories(
-        eval_data_path, time_start=config.time_start, time_end=config.time_end,
-        dt_data=config.dt_data)
+    # For simulation overfitting test: use TRAINING data (same trajectory) to verify overfitting
+    # For other modes: use test set for fair comparison
+    if is_sim_overfitting:
+        print(f'Pre-loading evaluation data (TRAINING trajectory #{overfitting_traj_idx} for overfitting test)...')
+        eval_data, eval_meta = load_mhd5_trajectories(
+            config.data_path,  # Use training data path!
+            time_start=config.time_start, time_end=config.time_end,
+            dt_data=config.dt_data,
+            single_trajectory=True,
+            traj_idx=overfitting_traj_idx)
+    else:
+        print(f'Pre-loading evaluation data (full test set)...')
+        eval_data, eval_meta = load_mhd5_trajectories(
+            eval_data_path, time_start=config.time_start, time_end=config.time_end,
+            dt_data=config.dt_data,
+            single_trajectory=False,
+            traj_idx=0)
+    
+    # Alias for backward compatibility in training data loading
+    is_overfitting = is_sim_overfitting
 
     # --- Build components needed by each mode ---
     offline_sampler = None
+    supervised_sampler = None
     grf = None
+    fixed_grf_sampler = None
 
     need_offline = data_mode in ('offline', 'staged', 'alternating')
     need_online = data_mode in ('online', 'staged', 'alternating')
+    
+    # Check if supervised loss is enabled
+    use_supervised = getattr(config, 'supervised_loss_weight', 0.0) > 0
+    
+    # Check if fixed GRF overfitting test is enabled
+    use_fixed_grf = bool(getattr(config, 'is_grf_overfitting_test', 0))
+    fixed_grf_seed = getattr(config, 'grf_overfitting_seed', 42)
 
     if need_offline:
         print(f'Loading training data from {config.data_path}...')
         loader, meta = _make_offline_loader(config)
         offline_sampler = _OfflineSampler(loader)
+        
+        # Load supervised pairs if supervised loss is enabled
+        if use_supervised:
+            print('Loading supervised (x_t, x_{t+1}) pairs for offline training...')
+            sup_pairs, sup_meta = _load_supervised_pairs(config)
+            supervised_sampler = _SupervisedOfflineSampler(
+                sup_pairs, config.batch_size, device=device, is_overfitting=is_overfitting)
+            print(f'  Supervised loss weight: {config.supervised_loss_weight}')
 
     if need_online:
-        print('Building GRF generator for online data...')
-        grf = _make_grf_generator(config)
+        if use_fixed_grf:
+            print('Building FIXED GRF generator for overfitting test...')
+            grf_gen = _make_grf_generator(config)
+            fixed_grf_sampler = FixedGRFDataSampler(grf_gen, fixed_seed=fixed_grf_seed)
+            fixed_grf_sampler.generate_fixed_data(config.batch_size)
+            grf = fixed_grf_sampler  # Use fixed sampler instead
+        else:
+            print('Building GRF generator for online data...')
+            grf = _make_grf_generator(config)
 
     print(f'Building MHD instance on {device}...')
     mhd = build_mhd_instance(device=device, Nx=config.Nx, Ny=config.Ny)
@@ -554,14 +879,15 @@ def train(config, net):
     print('-' * 60)
     sys.stdout.flush()
 
-    # --- Initial evaluation ---
+    # --- Initial evaluation (always use mhd_sim test set for fair comparison) ---
     print('Initial evaluation (step 0) ...')
     init_results = evaluate(
         config, net, eval_data, mhd,
         n_rollout_steps=config.eval_rollout_steps,
         save_plots=True, step_tag='step_0')
     best_loss = init_results['mean_rel_l2']
-    eval_history = [{'step': 0, 'mean_rel_l2': best_loss, 'train_loss': float('nan')}]
+    eval_history = [{'step': 0, 'mean_rel_l2': best_loss}]
+    train_loss_history = []  # Track training loss for convergence plot
     sys.stdout.flush()
 
     t_start = time.time()
@@ -600,11 +926,18 @@ def train(config, net):
 
         if source == 'online':
             x_0 = grf(config.batch_size)
+            net.train()
+            loss_val = _train_step(net, x_0, rhs_fn, optimizer, scheduler, config)
         else:
-            x_0 = offline_sampler.next_batch().to(device)
-
-        net.train()
-        loss_val = _train_step(net, x_0, rhs_fn, optimizer, scheduler, config)
+            # Offline mode: can use supervised loss if enabled
+            if use_supervised and supervised_sampler is not None:
+                x_0, x_target = supervised_sampler.next_batch()
+                net.train()
+                loss_val = _train_step(net, x_0, rhs_fn, optimizer, scheduler, config, x_target)
+            else:
+                x_0 = offline_sampler.next_batch().to(device)
+                net.train()
+                loss_val = _train_step(net, x_0, rhs_fn, optimizer, scheduler, config)
 
         running_loss += loss_val
         running_count += 1
@@ -613,7 +946,7 @@ def train(config, net):
         best_loss = _log_and_eval(
             config, net, global_step, loss_val, running_loss, running_count,
             t_start, eval_data, mhd, best_loss, run_tag, source,
-            eval_history)
+            eval_history, train_loss_history=train_loss_history)
 
         if global_step % config.log_every == 0:
             running_loss = 0.0
@@ -629,6 +962,7 @@ def train(config, net):
     else:
         print(f'  WARNING: best checkpoint not found at {best_path}, using latest weights')
 
+    # Final evaluation always uses mhd_sim test set
     final_results = evaluate(
         config, net, eval_data, mhd,
         n_rollout_steps=config.eval_rollout_steps,

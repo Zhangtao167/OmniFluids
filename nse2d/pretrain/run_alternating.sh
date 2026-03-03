@@ -17,7 +17,7 @@ ARGS=("$@")
 set --
 
 source /opt/conda/bin/activate
-conda activate /zhangtao/envs/rae
+conda activate /zhangtao/envs/rae || true
 cd /zhangtao/project2026/OmniFluids/nse2d/pretrain
 
 cd "$(dirname "$0")"

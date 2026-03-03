@@ -15,9 +15,14 @@ DEFAULT_EVAL_DATA = os.path.join(DATA_ROOT, '5field_mhd_batch_test/data/5field_m
 
 class TeeOutput:
     """Write to both file and terminal simultaneously."""
-    def __init__(self, filepath):
-        self.file = open(filepath, 'w')
-        self.terminal = sys.stdout
+    def __init__(self, filepath_or_file, terminal=None, mode='w'):
+        if isinstance(filepath_or_file, str):
+            self.file = open(filepath_or_file, mode)
+            self._owns_file = True
+        else:
+            self.file = filepath_or_file
+            self._owns_file = False
+        self.terminal = terminal if terminal is not None else sys.stdout
 
     def write(self, msg):
         self.terminal.write(msg)
@@ -26,6 +31,10 @@ class TeeOutput:
     def flush(self):
         self.terminal.flush()
         self.file.flush()
+    
+    def close(self):
+        if self._owns_file:
+            self.file.close()
 
 
 def generate_run_hash(cfg):
@@ -68,7 +77,10 @@ def run_train(cfg):
     make_run_dir(cfg)
 
     logfile = os.path.join(cfg.run_dir, 'log', f'log-{run_tag}.txt')
-    sys.stdout = TeeOutput(logfile)
+    # Redirect both stdout and stderr to the same log file
+    log_handle = open(logfile, 'w')
+    sys.stdout = TeeOutput(log_handle, terminal=sys.stdout)
+    sys.stderr = TeeOutput(log_handle, terminal=sys.stderr)
 
     print('=' * 60)
     print(f'5-field MHD OmniFluids Training  [{run_tag}]')
@@ -106,7 +118,35 @@ def run_inference(cfg):
 
     ckpt = torch.load(cfg.checkpoint, map_location=cfg.device, weights_only=False)
     saved_cfg = ckpt.get('config', {})
+    
+    # Check for architecture parameter conflicts between checkpoint and CLI
+    # Note: 'temperature' maps to 'T' parameter in OmniFluids2D constructor
+    arch_params = ['Nx', 'Ny', 'K', 'temperature', 'modes_x', 'modes_y', 'width', 'output_dim',
+                   'n_params', 'n_layers', 'factor', 'n_ff_layers', 'layer_norm']
+    conflicts = []
+    missing_in_ckpt = []
+    for param in arch_params:
+        saved_val = saved_cfg.get(param)
+        cli_val = getattr(cfg, param, None)
+        if saved_val is None and cli_val is not None:
+            missing_in_ckpt.append(f'  {param}: using CLI default={cli_val}')
+        elif saved_val is not None and cli_val is not None and saved_val != cli_val:
+            conflicts.append(f'  {param}: checkpoint={saved_val}, CLI={cli_val}')
+    
+    if conflicts or missing_in_ckpt:
+        print('=' * 60)
+        if conflicts:
+            print('WARNING: Architecture parameter conflicts detected!')
+            print('Using checkpoint values (ignoring CLI):')
+            for c in conflicts:
+                print(c)
+        if missing_in_ckpt:
+            print('NOTE: Some parameters missing from checkpoint (using CLI defaults):')
+            for m in missing_in_ckpt:
+                print(m)
+        print('=' * 60)
 
+    # Restore ALL architecture parameters from checkpoint to ensure model structure matches
     net = OmniFluids2D(
         Nx=saved_cfg.get('Nx', cfg.Nx),
         Ny=saved_cfg.get('Ny', cfg.Ny),
@@ -118,7 +158,10 @@ def run_inference(cfg):
         output_dim=saved_cfg.get('output_dim', cfg.output_dim),
         n_fields=5,
         n_params=saved_cfg.get('n_params', cfg.n_params),
-        n_layers=saved_cfg.get('n_layers', cfg.n_layers))
+        n_layers=saved_cfg.get('n_layers', cfg.n_layers),
+        factor=saved_cfg.get('factor', cfg.factor),
+        n_ff_layers=saved_cfg.get('n_ff_layers', cfg.n_ff_layers),
+        layer_norm=saved_cfg.get('layer_norm', cfg.layer_norm))
     net.load_state_dict(ckpt['model_state_dict'])
     net = net.to(cfg.device)
 
@@ -188,6 +231,14 @@ if __name__ == "__main__":
                         help='Scale of additive Gaussian noise on training input')
     parser.add_argument('--mae_weight', type=float, default=0.0,
                         help='Weight for MAE loss term (0=off, e.g. 0.1)')
+    parser.add_argument('--supervised_loss_weight', type=float, default=0.0,
+                        help='Weight for supervised loss on real data (0=off, e.g. 1.0)')
+    parser.add_argument('--supervised_mse_weight', type=float, default=1.0,
+                        help='MSE weight within supervised loss (default=1.0)')
+    parser.add_argument('--supervised_mae_weight', type=float, default=0.0,
+                        help='MAE weight within supervised loss (default=0.0)')
+    parser.add_argument('--physics_loss_weight', type=float, default=1.0,
+                        help='Weight for PDE physics loss (default=1.0, set 0 to disable)')
 
     parser.add_argument('--lr', type=float, default=0.002)
     parser.add_argument('--weight_decay', type=float, default=0.0)
@@ -214,8 +265,15 @@ if __name__ == "__main__":
                         help='1=derive GRF field_scales from data stats, 0=use defaults')
     parser.add_argument('--grf_use_radial_mask', type=int, default=1,
                         help='1=use radial mask for GRF (default), 0=disable (full Dirichlet)')
-    parser.add_argument('--grf_use_abs_constraint', type=int, default=1,
-                        help='1=apply abs() to n and Ti for positivity (default), 0=disable')
+
+    parser.add_argument('--is_overfitting_test', type=int, default=0,
+                        help='1=overfitting test: use single trajectory for train and eval')
+    parser.add_argument('--overfitting_traj_idx', type=int, default=0,
+                        help='Trajectory index to use for overfitting test (default=0)')
+    parser.add_argument('--is_grf_overfitting_test', type=int, default=0,
+                        help='1=use fixed GRF random data for overfitting test')
+    parser.add_argument('--grf_overfitting_seed', type=int, default=42,
+                        help='Seed for generating fixed GRF data (default=42)')
 
     parser.add_argument('--log_every', type=int, default=100)
     parser.add_argument('--eval_every', type=int, default=500)
