@@ -69,26 +69,51 @@ def make_run_dir(cfg):
 def run_train(cfg):
     """Build model and run training."""
     from model import OmniFluids2D
-    from train import train
+    from train import train, HAS_ACCELERATE
     from tools import setup_seed, param_count
 
+    # Check if using multi-GPU via Accelerate
+    use_accelerate = getattr(cfg, 'use_accelerate', False) and HAS_ACCELERATE
+    accelerator = None
+    is_main_process = True
+    
+    if use_accelerate:
+        from accelerate import Accelerator
+        accelerator = Accelerator()
+        is_main_process = accelerator.is_main_process
+        # Different seed per process for GRF diversity
+        cfg.seed = cfg.seed + accelerator.process_index
+    
     setup_seed(cfg.seed)
-    run_tag = make_run_tag(cfg)
-    make_run_dir(cfg)
+    
+    # Only main process handles logging and dir creation
+    if is_main_process:
+        run_tag = make_run_tag(cfg)
+        make_run_dir(cfg)
 
-    logfile = os.path.join(cfg.run_dir, 'log', f'log-{run_tag}.txt')
-    # Redirect both stdout and stderr to the same log file
-    log_handle = open(logfile, 'w')
-    sys.stdout = TeeOutput(log_handle, terminal=sys.stdout)
-    sys.stderr = TeeOutput(log_handle, terminal=sys.stderr)
+        logfile = os.path.join(cfg.run_dir, 'log', f'log-{run_tag}.txt')
+        # Redirect both stdout and stderr to the same log file
+        log_handle = open(logfile, 'w')
+        sys.stdout = TeeOutput(log_handle, terminal=sys.stdout)
+        sys.stderr = TeeOutput(log_handle, terminal=sys.stderr)
 
-    print('=' * 60)
-    print(f'5-field MHD OmniFluids Training  [{run_tag}]')
-    print('=' * 60)
-    for k, v in sorted(vars(cfg).items()):
-        print(f'  {k}: {v}')
-    print('=' * 60)
-    sys.stdout.flush()
+        print('=' * 60)
+        print(f'5-field MHD OmniFluids Training  [{run_tag}]')
+        print('=' * 60)
+        for k, v in sorted(vars(cfg).items()):
+            print(f'  {k}: {v}')
+        print('=' * 60)
+        sys.stdout.flush()
+    else:
+        # Non-main processes only need run_tag and run_dir path, NOT create dirs
+        # Directory creation is handled by main process only to avoid race conditions
+        run_tag = make_run_tag(cfg)
+        # Derive run_dir path without creating it (same logic as make_run_dir)
+        cfg.run_dir = os.path.join('results', cfg.exp_name, run_tag)
+    
+    # Sync before model creation
+    if accelerator is not None:
+        accelerator.wait_for_everyone()
 
     net = OmniFluids2D(
         Nx=cfg.Nx, Ny=cfg.Ny, K=cfg.K, T=cfg.temperature,
@@ -97,13 +122,17 @@ def run_train(cfg):
         n_fields=5, n_params=cfg.n_params,
         n_layers=cfg.n_layers, factor=cfg.factor,
         n_ff_layers=cfg.n_ff_layers, layer_norm=cfg.layer_norm)
-    param_count(net)
-    sys.stdout.flush()
+    
+    if is_main_process:
+        param_count(net)
+        sys.stdout.flush()
 
-    train(cfg, net)
+    # Pass accelerator to train function
+    train(cfg, net, accelerator=accelerator)
 
-    print(f'\nFinished at {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
-    sys.stdout.flush()
+    if is_main_process:
+        print(f'\nFinished at {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
+        sys.stdout.flush()
 
 
 def run_inference(cfg):
@@ -282,6 +311,8 @@ if __name__ == "__main__":
     parser.add_argument('--device', type=str, default='cuda:0')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--exp_name', type=str, default='mhd5_omnifluids_v1')
+    parser.add_argument('--use_accelerate', type=int, default=0,
+                        help='Use Accelerate for multi-GPU training (0=off, 1=on)')
 
     cfg = parser.parse_args()
 

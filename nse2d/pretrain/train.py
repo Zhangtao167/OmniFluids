@@ -17,6 +17,14 @@ from torch.utils.data import DataLoader, TensorDataset
 from tools import load_mhd5_snapshots, load_mhd5_trajectories, MHD5FieldGRF, FixedGRFDataSampler
 from psm_loss import build_mhd_instance, make_mhd5_rhs_fn, compute_physics_loss
 
+# Multi-GPU support via Accelerate
+try:
+    from accelerate import Accelerator
+    HAS_ACCELERATE = True
+except ImportError:
+    HAS_ACCELERATE = False
+    Accelerator = None
+
 FIELD_NAMES = ['n', 'U', 'vpar', 'psi', 'Ti']
 
 
@@ -518,17 +526,23 @@ class _SupervisedOfflineSampler:
         return x_0, x_target
 
 
-def _make_grf_generator(config):
-    """Build GRF random field generator."""
+def _make_grf_generator(config, device=None):
+    """Build GRF random field generator.
+    
+    Args:
+        config: Configuration object
+        device: Override device (for multi-GPU, use accelerator.device)
+    """
     # None -> use per-field defaults inside MHD5FieldGRF
     alpha = getattr(config, 'grf_alpha', None)
     tau = getattr(config, 'grf_tau', None)
     use_radial_mask = bool(getattr(config, 'grf_use_radial_mask', 1))
+    target_device = device if device is not None else config.device
     if getattr(config, 'grf_scale_from_data', 1):
         grf = MHD5FieldGRF.from_data_stats(
             config.data_path, Nx=config.Nx, Ny=config.Ny,
             alpha=alpha, tau=tau,
-            device=config.device,
+            device=target_device,
             time_start=config.time_start, time_end=config.time_end,
             dt_data=config.dt_data,
             use_radial_mask=use_radial_mask)
@@ -536,7 +550,7 @@ def _make_grf_generator(config):
         grf = MHD5FieldGRF(
             Nx=config.Nx, Ny=config.Ny,
             alpha=alpha, tau=tau,
-            device=config.device,
+            device=target_device,
             use_radial_mask=use_radial_mask)
     return grf
 
@@ -589,12 +603,13 @@ def _compute_supervised_loss(pred, target, mse_weight=1.0, mae_weight=0.0):
 # Unified training step
 # ---------------------------------------------------------------------------
 
-def _train_step(net, x_0, rhs_fn, optimizer, scheduler, config, x_target=None):
+def _train_step(net, x_0, rhs_fn, optimizer, scheduler, config, x_target=None, accelerator=None):
     """Execute one training step. Returns loss value.
     
     Args:
         x_target: Optional target state for supervised loss. If provided,
                   computes MSE/MAE between pred[..., -1] and x_target.
+        accelerator: Optional Accelerator instance for multi-GPU training.
     """
     noise_scale = getattr(config, 'input_noise_scale', 0.0)
     if noise_scale > 0:
@@ -635,7 +650,12 @@ def _train_step(net, x_0, rhs_fn, optimizer, scheduler, config, x_target=None):
             loss_components['sup_mse'] = sup_metrics['mse']
             loss_components['sup_mae'] = sup_metrics['mae']
 
-    total_loss.backward()
+    # Backward pass: use accelerator if available
+    if accelerator is not None:
+        accelerator.backward(total_loss)
+    else:
+        total_loss.backward()
+    
     if config.grad_clip is not None:
         torch.nn.utils.clip_grad_norm_(net.parameters(), config.grad_clip)
     optimizer.step()
@@ -697,17 +717,18 @@ def _plot_convergence(eval_history, save_path, train_loss_history=None):
 def _log_and_eval(config, net, global_step, loss_val, running_loss,
                   running_count, t_start, eval_data, mhd,
                   best_loss, run_tag, source_tag, eval_history,
-                  train_loss_history=None):
+                  train_loss_history=None, optimizer=None):
     """Handle periodic logging and evaluation. Returns updated best_loss.
     
     Evaluation always uses mhd_sim test set for fair comparison, regardless of training data source.
     
     Args:
         train_loss_history: list to append training loss for convergence plot
+        optimizer: optimizer instance (required for lr logging in multi-GPU mode)
     """
     if global_step % config.log_every == 0:
         avg = running_loss / max(running_count, 1)
-        lr_now = net._optimizer_ref.param_groups[0]['lr']
+        lr_now = optimizer.param_groups[0]['lr'] if optimizer else 0.0
         elapsed = time.time() - t_start
         it_s = global_step / max(elapsed, 1e-6)
         eta = (config.num_iterations - global_step) / max(it_s, 1e-6)
@@ -765,7 +786,7 @@ def _log_and_eval(config, net, global_step, loss_val, running_loss,
 # Main training loop (supports offline / online / staged / alternating)
 # ---------------------------------------------------------------------------
 
-def train(config, net):
+def train(config, net, accelerator=None):
     """Main training loop with multiple data modes.
 
     data_mode:
@@ -774,16 +795,30 @@ def train(config, net):
         staged      — online for online_warmup_steps, then offline for remainder
         alternating — cycle: alternate_online_steps online, then
                       alternate_offline_steps offline, repeat
+    
+    Args:
+        accelerator: Optional Accelerator instance for multi-GPU training.
     """
-    device = config.device
+    # --- Multi-GPU setup via Accelerate ---
+    is_main_process = True
+    
+    if accelerator is not None:
+        is_main_process = accelerator.is_main_process
+        device = accelerator.device
+        if is_main_process:
+            print(f'[Accelerate] Using {accelerator.num_processes} GPU(s), device={device}')
+    else:
+        device = config.device
+    
     run_tag = getattr(config, 'run_tag', config.exp_name)
     data_mode = getattr(config, 'data_mode', 'offline')
     eval_data_path = getattr(config, 'eval_data_path', config.data_path)
 
-    if eval_data_path == config.data_path:
-        print('  WARNING: eval_data_path not set, using training data for evaluation!')
-    else:
-        print(f'Evaluation will use test set: {eval_data_path}')
+    if is_main_process:
+        if eval_data_path == config.data_path:
+            print('  WARNING: eval_data_path not set, using training data for evaluation!')
+        else:
+            print(f'Evaluation will use test set: {eval_data_path}')
 
     # Training data overfitting flags
     is_sim_overfitting = bool(getattr(config, 'is_overfitting_test', 0))  # Simulation data overfitting
@@ -793,7 +828,8 @@ def train(config, net):
     # For simulation overfitting test: use TRAINING data (same trajectory) to verify overfitting
     # For other modes: use test set for fair comparison
     if is_sim_overfitting:
-        print(f'Pre-loading evaluation data (TRAINING trajectory #{overfitting_traj_idx} for overfitting test)...')
+        if is_main_process:
+            print(f'Pre-loading evaluation data (TRAINING trajectory #{overfitting_traj_idx} for overfitting test)...')
         eval_data, eval_meta = load_mhd5_trajectories(
             config.data_path,  # Use training data path!
             time_start=config.time_start, time_end=config.time_end,
@@ -801,7 +837,8 @@ def train(config, net):
             single_trajectory=True,
             traj_idx=overfitting_traj_idx)
     else:
-        print(f'Pre-loading evaluation data (full test set)...')
+        if is_main_process:
+            print(f'Pre-loading evaluation data (full test set)...')
         eval_data, eval_meta = load_mhd5_trajectories(
             eval_data_path, time_start=config.time_start, time_end=config.time_end,
             dt_data=config.dt_data,
@@ -828,30 +865,36 @@ def train(config, net):
     fixed_grf_seed = getattr(config, 'grf_overfitting_seed', 42)
 
     if need_offline:
-        print(f'Loading training data from {config.data_path}...')
+        if is_main_process:
+            print(f'Loading training data from {config.data_path}...')
         loader, meta = _make_offline_loader(config)
         offline_sampler = _OfflineSampler(loader)
         
         # Load supervised pairs if supervised loss is enabled
         if use_supervised:
-            print('Loading supervised (x_t, x_{t+1}) pairs for offline training...')
+            if is_main_process:
+                print('Loading supervised (x_t, x_{t+1}) pairs for offline training...')
             sup_pairs, sup_meta = _load_supervised_pairs(config)
             supervised_sampler = _SupervisedOfflineSampler(
                 sup_pairs, config.batch_size, device=device, is_overfitting=is_overfitting)
-            print(f'  Supervised loss weight: {config.supervised_loss_weight}')
+            if is_main_process:
+                print(f'  Supervised loss weight: {config.supervised_loss_weight}')
 
     if need_online:
         if use_fixed_grf:
-            print('Building FIXED GRF generator for overfitting test...')
-            grf_gen = _make_grf_generator(config)
+            if is_main_process:
+                print('Building FIXED GRF generator for overfitting test...')
+            grf_gen = _make_grf_generator(config, device=device)
             fixed_grf_sampler = FixedGRFDataSampler(grf_gen, fixed_seed=fixed_grf_seed)
             fixed_grf_sampler.generate_fixed_data(config.batch_size)
             grf = fixed_grf_sampler  # Use fixed sampler instead
         else:
-            print('Building GRF generator for online data...')
-            grf = _make_grf_generator(config)
+            if is_main_process:
+                print('Building GRF generator for online data...')
+            grf = _make_grf_generator(config, device=device)
 
-    print(f'Building MHD instance on {device}...')
+    if is_main_process:
+        print(f'Building MHD instance on {device}...')
     mhd = build_mhd_instance(device=device, Nx=config.Nx, Ny=config.Ny)
     rhs_fn = make_mhd5_rhs_fn(mhd, model_dtype=torch.float32)
 
@@ -860,35 +903,48 @@ def train(config, net):
                            weight_decay=config.weight_decay)
     scheduler = _make_scheduler(optimizer, config.lr, config.num_iterations)
 
-    # Expose optimizer for logging helper
-    net._optimizer_ref = optimizer
+    # Wrap with Accelerator if using multi-GPU
+    if accelerator is not None:
+        net, optimizer, scheduler = accelerator.prepare(net, optimizer, scheduler)
 
     train_dt = config.rollout_dt / config.output_dim
     n_substeps_eval = max(1, round(config.dt_data / config.rollout_dt))
-    print(f'  dt hierarchy: rollout_dt={config.rollout_dt}, '
-          f'train_dt={train_dt:.4f} (output_dim={config.output_dim}), '
-          f'dt_data={config.dt_data}, n_substeps_eval={n_substeps_eval}')
-    print(f'  data_mode={data_mode}')
-    if data_mode == 'staged':
-        print(f'    online_warmup_steps={config.online_warmup_steps}')
-    elif data_mode == 'alternating':
-        print(f'    alternate: {config.alternate_online_steps} online / '
-              f'{config.alternate_offline_steps} offline per cycle')
-    print(f'\n[{run_tag}] Training: {config.num_iterations} iters, '
-          f'bs={config.batch_size}, lr={config.lr}')
-    print('-' * 60)
-    sys.stdout.flush()
+    if is_main_process:
+        print(f'  dt hierarchy: rollout_dt={config.rollout_dt}, '
+              f'train_dt={train_dt:.4f} (output_dim={config.output_dim}), '
+              f'dt_data={config.dt_data}, n_substeps_eval={n_substeps_eval}')
+        print(f'  data_mode={data_mode}')
+        if data_mode == 'staged':
+            print(f'    online_warmup_steps={config.online_warmup_steps}')
+        elif data_mode == 'alternating':
+            print(f'    alternate: {config.alternate_online_steps} online / '
+                  f'{config.alternate_offline_steps} offline per cycle')
+        print(f'\n[{run_tag}] Training: {config.num_iterations} iters, '
+              f'bs={config.batch_size}, lr={config.lr}')
+        print('-' * 60)
+        sys.stdout.flush()
 
     # --- Initial evaluation (always use mhd_sim test set for fair comparison) ---
-    print('Initial evaluation (step 0) ...')
-    init_results = evaluate(
-        config, net, eval_data, mhd,
-        n_rollout_steps=config.eval_rollout_steps,
-        save_plots=True, step_tag='step_0')
-    best_loss = init_results['mean_rel_l2']
+    # Only run evaluation on main process to avoid duplicate computation
+    if is_main_process:
+        print('Initial evaluation (step 0) ...')
+        # For DDP, unwrap model for evaluation
+        eval_net = accelerator.unwrap_model(net) if accelerator is not None else net
+        init_results = evaluate(
+            config, eval_net, eval_data, mhd,
+            n_rollout_steps=config.eval_rollout_steps,
+            save_plots=True, step_tag='step_0')
+        best_loss = init_results['mean_rel_l2']
+        sys.stdout.flush()
+    else:
+        best_loss = float('inf')
+    
+    # Sync all processes after initial evaluation
+    if accelerator is not None:
+        accelerator.wait_for_everyone()
+    
     eval_history = [{'step': 0, 'mean_rel_l2': best_loss}]
     train_loss_history = []  # Track training loss for convergence plot
-    sys.stdout.flush()
 
     t_start = time.time()
     global_step = 0
@@ -917,62 +973,84 @@ def train(config, net):
         if data_mode == 'staged' and prev_source == 'online' and source == 'offline':
             remaining = config.num_iterations - global_step
             scheduler = _make_scheduler(optimizer, config.lr, remaining)
-            print(f'\n[{run_tag[:8]}] === STAGED SWITCH: online -> offline at step '
-                  f'{global_step} (remaining {remaining} steps, lr scheduler reset) ===\n')
+            if is_main_process:
+                print(f'\n[{run_tag[:8]}] === STAGED SWITCH: online -> offline at step '
+                      f'{global_step} (remaining {remaining} steps, lr scheduler reset) ===\n')
             running_loss = 0.0
             running_count = 0
-            sys.stdout.flush()
+            if is_main_process:
+                sys.stdout.flush()
         prev_source = source
 
         if source == 'online':
             x_0 = grf(config.batch_size)
             net.train()
-            loss_val = _train_step(net, x_0, rhs_fn, optimizer, scheduler, config)
+            loss_val = _train_step(net, x_0, rhs_fn, optimizer, scheduler, config, accelerator=accelerator)
         else:
             # Offline mode: can use supervised loss if enabled
             if use_supervised and supervised_sampler is not None:
                 x_0, x_target = supervised_sampler.next_batch()
                 net.train()
-                loss_val = _train_step(net, x_0, rhs_fn, optimizer, scheduler, config, x_target)
+                loss_val = _train_step(net, x_0, rhs_fn, optimizer, scheduler, config, x_target, accelerator=accelerator)
             else:
                 x_0 = offline_sampler.next_batch().to(device)
                 net.train()
-                loss_val = _train_step(net, x_0, rhs_fn, optimizer, scheduler, config)
+                loss_val = _train_step(net, x_0, rhs_fn, optimizer, scheduler, config, accelerator=accelerator)
 
         running_loss += loss_val
         running_count += 1
         global_step += 1
 
-        best_loss = _log_and_eval(
-            config, net, global_step, loss_val, running_loss, running_count,
-            t_start, eval_data, mhd, best_loss, run_tag, source,
-            eval_history, train_loss_history=train_loss_history)
+        # Sync BEFORE evaluation to prevent deadlock:
+        # - Without sync, non-main processes continue to next training step
+        # - Next step's backward() requires all processes to participate
+        # - But main process is still evaluating -> deadlock
+        if accelerator is not None and global_step % config.eval_every == 0:
+            accelerator.wait_for_everyone()
+        
+        # Only log and eval on main process
+        if is_main_process:
+            eval_net = accelerator.unwrap_model(net) if accelerator is not None else net
+            best_loss = _log_and_eval(
+                config, eval_net, global_step, loss_val, running_loss, running_count,
+                t_start, eval_data, mhd, best_loss, run_tag, source,
+                eval_history, train_loss_history=train_loss_history, optimizer=optimizer)
+        
+        # Sync AFTER evaluation so non-main processes wait for main to finish
+        if accelerator is not None and global_step % config.eval_every == 0:
+            accelerator.wait_for_everyone()
 
-        if global_step % config.log_every == 0:
+        if is_main_process and global_step % config.log_every == 0:
             running_loss = 0.0
             running_count = 0
 
-    # --- Final evaluation with best model ---
-    best_path = os.path.join(config.run_dir, 'model', f'best-{run_tag}.pt')
-    print(f'\n--- Final Evaluation [{run_tag}] ---')
-    if os.path.exists(best_path):
-        net.load_state_dict(
-            torch.load(best_path, map_location=device,
-                       weights_only=False)['model_state_dict'])
-    else:
-        print(f'  WARNING: best checkpoint not found at {best_path}, using latest weights')
+    # --- Final evaluation with best model (main process only) ---
+    if is_main_process:
+        best_path = os.path.join(config.run_dir, 'model', f'best-{run_tag}.pt')
+        print(f'\n--- Final Evaluation [{run_tag}] ---')
+        eval_net = accelerator.unwrap_model(net) if accelerator is not None else net
+        if os.path.exists(best_path):
+            eval_net.load_state_dict(
+                torch.load(best_path, map_location=device,
+                           weights_only=False)['model_state_dict'])
+        else:
+            print(f'  WARNING: best checkpoint not found at {best_path}, using latest weights')
 
-    # Final evaluation always uses mhd_sim test set
-    final_results = evaluate(
-        config, net, eval_data, mhd,
-        n_rollout_steps=config.eval_rollout_steps,
-        save_plots=True, step_tag=f'final-{run_tag}')
+        # Final evaluation always uses mhd_sim test set
+        final_results = evaluate(
+            config, eval_net, eval_data, mhd,
+            n_rollout_steps=config.eval_rollout_steps,
+            save_plots=True, step_tag=f'final-{run_tag}')
 
-    results_path = os.path.join(config.run_dir, f'eval-{run_tag}.json')
-    with open(results_path, 'w') as f:
-        json.dump(final_results, f, indent=2)
-    print(f'Results saved to {results_path}')
+        results_path = os.path.join(config.run_dir, f'eval-{run_tag}.json')
+        with open(results_path, 'w') as f:
+            json.dump(final_results, f, indent=2)
+        print(f'Results saved to {results_path}')
 
-    total_time = time.time() - t_start
-    print(f'Total training time: {total_time/3600:.1f}h ({total_time/60:.0f}m)')
-    sys.stdout.flush()
+        total_time = time.time() - t_start
+        print(f'Total training time: {total_time/3600:.1f}h ({total_time/60:.0f}m)')
+        sys.stdout.flush()
+    
+    # Wait for all processes to finish
+    if accelerator is not None:
+        accelerator.wait_for_everyone()
