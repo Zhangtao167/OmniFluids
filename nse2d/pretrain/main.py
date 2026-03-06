@@ -304,6 +304,37 @@ if __name__ == "__main__":
     parser.add_argument('--grf_overfitting_seed', type=int, default=42,
                         help='Seed for generating fixed GRF data (default=42)')
 
+    # Self-training mode: use training model itself to generate data
+    parser.add_argument('--self_training_start_step', type=int, default=0,
+                        help='Step to start using model-evolved data (0=disabled). '
+                             'Before this step, uses raw GRF. After, uses model-evolved GRF.')
+    parser.add_argument('--self_training_update_every', type=int, default=5000,
+                        help='Update data generator model weights every N steps (0=never update). '
+                             'Only applies to self-training mode.')
+    parser.add_argument('--self_training_rollout_steps', type=int, default=10,
+                        help='Number of model inference steps to evolve GRF in self-training mode')
+
+    # External pretrained model mode: use a fixed pretrained model to generate data
+    parser.add_argument('--pretrained_model_path', type=str, default=None,
+                        help='Path to external pretrained model for data generation. '
+                             'If set, uses this fixed model instead of self-training mode. '
+                             'The pretrained model will evolve GRF before feeding to training.')
+    parser.add_argument('--pretrained_rollout_steps', type=int, default=10,
+                        help='Number of inference steps for external pretrained model to evolve GRF')
+
+    # Mixed integrator (Euler/CN) parameters
+    parser.add_argument('--use_mixed_integrator', type=int, default=0,
+                        help='Enable mixed Euler/CN integrator (0=off, 1=on). '
+                             'When enabled, computes both Euler and CN losses and combines them.')
+    parser.add_argument('--euler_weight_init', type=float, default=1.0,
+                        help='Initial Euler weight (1.0 = pure Euler, 0.0 = pure CN)')
+    parser.add_argument('--euler_weight_min', type=float, default=0.0,
+                        help='Minimum Euler weight after decay (0.0 = pure CN)')
+    parser.add_argument('--euler_anneal_start', type=int, default=0,
+                        help='Step to start annealing Euler weight (before this, use euler_weight_init)')
+    parser.add_argument('--euler_half_life', type=int, default=10000,
+                        help='Half-life for Euler weight exponential decay (steps)')
+
     parser.add_argument('--log_every', type=int, default=100)
     parser.add_argument('--eval_every', type=int, default=500)
     parser.add_argument('--eval_rollout_steps', type=int, default=10)

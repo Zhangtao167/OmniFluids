@@ -14,7 +14,8 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
-from tools import load_mhd5_snapshots, load_mhd5_trajectories, MHD5FieldGRF, FixedGRFDataSampler
+from tools import (load_mhd5_snapshots, load_mhd5_trajectories, MHD5FieldGRF, 
+                   FixedGRFDataSampler, ModelEvolvedGRFGenerator)
 from psm_loss import build_mhd_instance, make_mhd5_rhs_fn, compute_physics_loss
 
 # Multi-GPU support via Accelerate
@@ -84,16 +85,16 @@ def save_eval_plots(pred_traj, gt_traj, rel_l2_total, rel_l2_per_field,
     plt.savefig(os.path.join(save_dir, f'error_curves_{tag}.png'), dpi=150)
     plt.close(fig)
 
-    # ===== 2. GT / Pred / Error snapshots (3 rows per field) =====
+    # ===== 2. GT / Pred / Error / GT Residual / Pred Residual snapshots (5 rows per field) =====
     plot_steps = [0, n_steps // 4, n_steps // 2, 3 * n_steps // 4, n_steps]
     plot_steps = sorted(set(s for s in plot_steps if s < T_total))
     b_idx = 0
     n_cols = len(plot_steps)
 
     for c, name in enumerate(FIELD_NAMES):
-        fig, axes = plt.subplots(3, n_cols, figsize=(4 * n_cols, 10))
+        fig, axes = plt.subplots(5, n_cols, figsize=(4 * n_cols, 16))
         if n_cols == 1:
-            axes = axes.reshape(3, 1)
+            axes = axes.reshape(5, 1)
         for j, t in enumerate(plot_steps):
             gt_snap = gt_traj[b_idx, t, c].cpu().numpy()
             pred_snap = pred_traj[b_idx, t, c].cpu().numpy()
@@ -103,26 +104,60 @@ def save_eval_plots(pred_traj, gt_traj, rel_l2_total, rel_l2_per_field,
             t_phys = time_start + t * n_substeps * rollout_dt
             ic_tag = ' (IC)' if t == 0 else ''
 
+            # GT residual: gt[t] - gt[t-1], first frame = 0
+            if t > 0:
+                gt_prev = gt_traj[b_idx, t - 1, c].cpu().numpy()
+                gt_residual = gt_snap - gt_prev
+            else:
+                gt_residual = np.zeros_like(gt_snap)
+            
+            # Pred residual: pred[t] - pred[t-1], first frame = 0
+            if t > 0:
+                pred_prev = pred_traj[b_idx, t - 1, c].cpu().numpy()
+                pred_residual = pred_snap - pred_prev
+            else:
+                pred_residual = np.zeros_like(pred_snap)
+            
+            # Shared residual color scale
+            res_abs = max(abs(gt_residual).max(), abs(pred_residual).max(), 1e-10)
+
+            # Row 0: GT
             im0 = axes[0, j].imshow(gt_snap, aspect='auto',
                                     vmin=vmin, vmax=vmax, cmap='RdBu_r')
             axes[0, j].set_title(f'GT t={t_phys:.1f}s{ic_tag}', fontsize=9)
             fig.colorbar(im0, ax=axes[0, j], fraction=0.046)
 
+            # Row 1: Pred
             im1 = axes[1, j].imshow(pred_snap, aspect='auto',
                                     vmin=vmin, vmax=vmax, cmap='RdBu_r')
             axes[1, j].set_title(f'Pred t={t_phys:.1f}s', fontsize=9)
             fig.colorbar(im1, ax=axes[1, j], fraction=0.046)
 
+            # Row 2: Error (Pred - GT)
             im2 = axes[2, j].imshow(err_snap, aspect='auto',
                                     vmin=-err_abs, vmax=err_abs, cmap='bwr')
             axes[2, j].set_title(f'Err t={t_phys:.1f}s', fontsize=9)
             fig.colorbar(im2, ax=axes[2, j], fraction=0.046)
 
+            # Row 3: GT Residual (gt[t] - gt[t-1])
+            im3 = axes[3, j].imshow(gt_residual, aspect='auto',
+                                    vmin=-res_abs, vmax=res_abs, cmap='PuOr')
+            axes[3, j].set_title(f'GT Δ t={t_phys:.1f}s', fontsize=9)
+            fig.colorbar(im3, ax=axes[3, j], fraction=0.046)
+
+            # Row 4: Pred Residual (pred[t] - pred[t-1])
+            im4 = axes[4, j].imshow(pred_residual, aspect='auto',
+                                    vmin=-res_abs, vmax=res_abs, cmap='PuOr')
+            axes[4, j].set_title(f'Pred Δ t={t_phys:.1f}s', fontsize=9)
+            fig.colorbar(im4, ax=axes[4, j], fraction=0.046)
+
             if j == 0:
                 axes[0, j].set_ylabel('GT\nx (radial)')
                 axes[1, j].set_ylabel('Pred\nx (radial)')
                 axes[2, j].set_ylabel('Error\nx (radial)')
-            axes[2, j].set_xlabel('y (binormal)')
+                axes[3, j].set_ylabel('GT Δ\nx (radial)')
+                axes[4, j].set_ylabel('Pred Δ\nx (radial)')
+            axes[4, j].set_xlabel('y (binormal)')
 
         fig.suptitle(f'{name} ({tag})', fontsize=14)
         plt.tight_layout()
@@ -555,6 +590,102 @@ def _make_grf_generator(config, device=None):
     return grf
 
 
+def _make_pretrained_generator(grf, ckpt_path, config, device='cpu', verbose=True):
+    """Create ModelEvolvedGRFGenerator with external pretrained model.
+    
+    Args:
+        grf: MHD5FieldGRF instance
+        ckpt_path: Path to pretrained model checkpoint
+        config: Configuration object
+        device: Target device
+        verbose: Whether to print status messages (set False for non-main processes)
+    
+    Returns:
+        ModelEvolvedGRFGenerator with loaded pretrained model (activated)
+    """
+    from model import OmniFluids2D
+    
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    saved_cfg = ckpt.get('config', {})
+    
+    # Reconstruct model architecture from checkpoint config
+    pretrained_net = OmniFluids2D(
+        Nx=saved_cfg.get('Nx', config.Nx),
+        Ny=saved_cfg.get('Ny', config.Ny),
+        K=saved_cfg.get('K', config.K),
+        T=saved_cfg.get('temperature', 10.0),
+        modes_x=saved_cfg.get('modes_x', config.modes_x),
+        modes_y=saved_cfg.get('modes_y', config.modes_y),
+        width=saved_cfg.get('width', config.width),
+        output_dim=saved_cfg.get('output_dim', config.output_dim),
+        n_fields=5,
+        n_params=saved_cfg.get('n_params', config.n_params),
+        n_layers=saved_cfg.get('n_layers', config.n_layers),
+        factor=saved_cfg.get('factor', config.factor),
+        n_ff_layers=saved_cfg.get('n_ff_layers', config.n_ff_layers),
+        layer_norm=saved_cfg.get('layer_norm', True))
+    
+    pretrained_net.load_state_dict(ckpt['model_state_dict'])
+    pretrained_net = pretrained_net.to(device)
+    
+    rollout_steps = getattr(config, 'pretrained_rollout_steps', 10)
+    
+    if verbose:
+        print(f'[External Model Mode] Loaded pretrained model from step {ckpt.get("step", "?")}')
+        print(f'  Model will evolve GRF for {rollout_steps} steps')
+    
+    generator = ModelEvolvedGRFGenerator(
+        pretrained_net, grf, rollout_steps=rollout_steps, device=device, verbose=verbose)
+    generator.activate()  # External model is activated immediately
+    return generator
+
+
+def _make_self_training_generator(grf, training_net, config, device='cpu', verbose=True):
+    """Create ModelEvolvedGRFGenerator using a COPY of the training model.
+    
+    IMPORTANT: Creates a separate model instance to avoid gradient interference.
+    The generator's model is completely isolated from the training model.
+    
+    Args:
+        grf: MHD5FieldGRF instance
+        training_net: The training model (weights will be copied, not referenced)
+        config: Configuration object
+        device: Target device
+        verbose: Whether to print status messages (set False for non-main processes)
+    
+    Returns:
+        ModelEvolvedGRFGenerator (NOT activated - will be activated at start_step)
+    """
+    from model import OmniFluids2D
+    
+    # Create a separate model instance (same architecture as training model)
+    generator_net = OmniFluids2D(
+        Nx=config.Nx, Ny=config.Ny, K=config.K, T=config.temperature,
+        modes_x=config.modes_x, modes_y=config.modes_y,
+        width=config.width, output_dim=config.output_dim,
+        n_fields=5, n_params=config.n_params,
+        n_layers=config.n_layers, factor=config.factor,
+        n_ff_layers=config.n_ff_layers, layer_norm=config.layer_norm)
+    
+    # Copy current weights (will be updated periodically)
+    generator_net.load_state_dict(training_net.state_dict())
+    generator_net = generator_net.to(device)
+    
+    rollout_steps = getattr(config, 'self_training_rollout_steps', 10)
+    
+    if verbose:
+        print(f'[Self-Training Mode] Created generator model (copy of training model)')
+        print(f'  Will activate at step {config.self_training_start_step}')
+        print(f'  Rollout steps: {rollout_steps}')
+        update_every = getattr(config, 'self_training_update_every', 0)
+        if update_every > 0:
+            print(f'  Will update weights every {update_every} steps')
+    
+    # NOT activated here - will be activated in training loop at start_step
+    return ModelEvolvedGRFGenerator(
+        generator_net, grf, rollout_steps=rollout_steps, device=device, verbose=verbose)
+
+
 def _make_scheduler(optimizer, lr, total_steps):
     """Create a fresh OneCycleLR scheduler."""
     return optim.lr_scheduler.OneCycleLR(
@@ -600,16 +731,56 @@ def _compute_supervised_loss(pred, target, mse_weight=1.0, mae_weight=0.0):
 
 
 # ---------------------------------------------------------------------------
+# Mixed integrator (Euler/CN) weight schedule
+# ---------------------------------------------------------------------------
+
+def _get_euler_weight(step, config):
+    """Compute current Euler weight for mixed integrator mode.
+    
+    Uses exponential decay: w(t) = min + (init - min) * 0.5^((t - start) / half_life)
+    
+    Args:
+        step: Current training step
+        config: Configuration object with euler_weight_* parameters
+    
+    Returns:
+        float: Current Euler weight, or None if mixed integrator is disabled
+    """
+    if not getattr(config, 'use_mixed_integrator', 0):
+        return None
+    
+    init = getattr(config, 'euler_weight_init', 1.0)
+    min_w = getattr(config, 'euler_weight_min', 0.0)
+    anneal_start = getattr(config, 'euler_anneal_start', 0)
+    half_life = getattr(config, 'euler_half_life', 10000)
+    
+    if step < anneal_start:
+        return init
+    
+    if half_life <= 0:
+        return min_w
+    
+    t = step - anneal_start
+    decay = 0.5 ** (t / half_life)
+    w = min_w + (init - min_w) * decay
+    return w
+
+
+# ---------------------------------------------------------------------------
 # Unified training step
 # ---------------------------------------------------------------------------
 
-def _train_step(net, x_0, rhs_fn, optimizer, scheduler, config, x_target=None, accelerator=None):
-    """Execute one training step. Returns loss value.
+def _train_step(net, x_0, rhs_fn, optimizer, scheduler, config, x_target=None, accelerator=None, euler_weight=None):
+    """Execute one training step. Returns (loss_value, loss_components).
     
     Args:
         x_target: Optional target state for supervised loss. If provided,
                   computes MSE/MAE between pred[..., -1] and x_target.
         accelerator: Optional Accelerator instance for multi-GPU training.
+        euler_weight: If not None, use mixed integrator mode with this weight.
+    
+    Returns:
+        (loss_value, loss_components): loss value and dict with component losses
     """
     noise_scale = getattr(config, 'input_noise_scale', 0.0)
     if noise_scale > 0:
@@ -618,18 +789,36 @@ def _train_step(net, x_0, rhs_fn, optimizer, scheduler, config, x_target=None, a
 
     # Physics loss (PDE loss)
     phys_loss_weight = getattr(config, 'physics_loss_weight', 1.0)
+    loss_components = {}
+    
     if phys_loss_weight > 0:
-        phys_loss = compute_physics_loss(
-            pred_traj, x_0, rhs_fn,
-            rollout_dt=config.rollout_dt,
-            output_dim=config.output_dim,
-            time_integrator=config.time_integrator,
-            mae_weight=getattr(config, 'mae_weight', 0.0))
+        if euler_weight is not None:
+            # Mixed integrator mode: returns (combined_loss, {'euler': ..., 'cn': ...})
+            phys_loss, integrator_losses = compute_physics_loss(
+                pred_traj, x_0, rhs_fn,
+                rollout_dt=config.rollout_dt,
+                output_dim=config.output_dim,
+                time_integrator=config.time_integrator,
+                mae_weight=getattr(config, 'mae_weight', 0.0),
+                euler_weight=euler_weight)
+            loss_components['phys'] = phys_loss.item()
+            loss_components['euler_loss'] = integrator_losses['euler']
+            loss_components['cn_loss'] = integrator_losses['cn']
+            loss_components['euler_weight'] = euler_weight
+        else:
+            # Single integrator mode
+            phys_loss = compute_physics_loss(
+                pred_traj, x_0, rhs_fn,
+                rollout_dt=config.rollout_dt,
+                output_dim=config.output_dim,
+                time_integrator=config.time_integrator,
+                mae_weight=getattr(config, 'mae_weight', 0.0))
+            loss_components['phys'] = phys_loss.item()
+        
         total_loss = phys_loss_weight * phys_loss
-        loss_components = {'phys': phys_loss.item()}
     else:
         total_loss = torch.tensor(0.0, device=pred_traj.device, dtype=pred_traj.dtype)
-        loss_components = {'phys': 0.0}
+        loss_components['phys'] = 0.0
     
     # Supervised loss (only when target is provided)
     if x_target is not None:
@@ -662,7 +851,7 @@ def _train_step(net, x_0, rhs_fn, optimizer, scheduler, config, x_target=None, a
     optimizer.zero_grad(set_to_none=True)
     scheduler.step()
     
-    return total_loss.item()
+    return total_loss.item(), loss_components
 
 
 # ---------------------------------------------------------------------------
@@ -670,7 +859,10 @@ def _train_step(net, x_0, rhs_fn, optimizer, scheduler, config, x_target=None, a
 # ---------------------------------------------------------------------------
 
 def _plot_convergence(eval_history, save_path, train_loss_history=None):
-    """Plot evaluation and training loss vs training step."""
+    """Plot evaluation and training loss vs training step.
+    
+    If mixed integrator is used, also plots Euler loss, CN loss, and euler_weight.
+    """
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
@@ -678,8 +870,18 @@ def _plot_convergence(eval_history, save_path, train_loss_history=None):
     steps = [h['step'] for h in eval_history]
     mean_l2 = [h['mean_rel_l2'] for h in eval_history]
     best_idx = int(np.argmin(mean_l2))
-
-    fig, ax = plt.subplots(figsize=(10, 5))
+    
+    # Check if we have mixed integrator data
+    has_mixed = (train_loss_history and len(train_loss_history) > 0 and
+                 'euler_loss' in train_loss_history[0])
+    
+    if has_mixed:
+        # Two subplots: (1) losses, (2) euler_weight
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        ax = axes[0]
+        ax_weight = axes[1]
+    else:
+        fig, ax = plt.subplots(figsize=(10, 5))
     
     # Plot evaluation loss
     ax.plot(steps, mean_l2, 'b-o', markersize=3, label='eval loss')
@@ -691,11 +893,29 @@ def _plot_convergence(eval_history, save_path, train_loss_history=None):
         train_steps = [h['step'] for h in train_loss_history]
         train_loss = [h['train_loss'] for h in train_loss_history]
         ax.plot(train_steps, train_loss, 'g-', alpha=0.6, linewidth=1, label='train loss (avg)')
+        
+        # Plot Euler and CN losses if mixed integrator
+        if has_mixed:
+            euler_losses = [h.get('euler_loss', 0) for h in train_loss_history]
+            cn_losses = [h.get('cn_loss', 0) for h in train_loss_history]
+            ax.plot(train_steps, euler_losses, 'm-', alpha=0.5, linewidth=1, label='euler loss')
+            ax.plot(train_steps, cn_losses, 'c-', alpha=0.5, linewidth=1, label='cn loss')
+            
+            # Plot euler_weight on secondary axis
+            euler_weights = [h.get('euler_weight', 1.0) for h in train_loss_history]
+            ax_weight.plot(train_steps, euler_weights, 'k-', linewidth=2, label='euler_weight')
+            ax_weight.set_xlabel('Training step')
+            ax_weight.set_ylabel('Euler Weight')
+            ax_weight.set_title('Euler Weight Schedule (Exponential Decay)')
+            ax_weight.set_ylim(-0.05, 1.05)
+            ax_weight.grid(True, alpha=0.3)
+            ax_weight.legend()
+            ax_weight.axhline(y=0.5, color='gray', linestyle='--', alpha=0.5, label='50%')
     
     ax.set_xlabel('Training step')
     ax.set_ylabel('Loss')
     ax.set_title('Training & Evaluation Convergence')
-    ax.legend()
+    ax.legend(loc='upper right')
     ax.grid(True, alpha=0.3)
     
     # Use log scale if loss varies significantly
@@ -717,7 +937,7 @@ def _plot_convergence(eval_history, save_path, train_loss_history=None):
 def _log_and_eval(config, net, global_step, loss_val, running_loss,
                   running_count, t_start, eval_data, mhd,
                   best_loss, run_tag, source_tag, eval_history,
-                  train_loss_history=None, optimizer=None):
+                  train_loss_history=None, optimizer=None, loss_components=None):
     """Handle periodic logging and evaluation. Returns updated best_loss.
     
     Evaluation always uses mhd_sim test set for fair comparison, regardless of training data source.
@@ -725,6 +945,7 @@ def _log_and_eval(config, net, global_step, loss_val, running_loss,
     Args:
         train_loss_history: list to append training loss for convergence plot
         optimizer: optimizer instance (required for lr logging in multi-GPU mode)
+        loss_components: dict with individual loss components (euler_loss, cn_loss, euler_weight)
     """
     if global_step % config.log_every == 0:
         avg = running_loss / max(running_count, 1)
@@ -732,15 +953,32 @@ def _log_and_eval(config, net, global_step, loss_val, running_loss,
         elapsed = time.time() - t_start
         it_s = global_step / max(elapsed, 1e-6)
         eta = (config.num_iterations - global_step) / max(it_s, 1e-6)
-        print(f'[{run_tag[:8]}] step {global_step:6d}/{config.num_iterations} '
-              f'| loss {loss_val:.6f} | avg {avg:.6f} '
-              f'| lr {lr_now:.2e} | {it_s:.1f} it/s | ETA {eta/60:.0f}m '
-              f'| src={source_tag}')
+        
+        # Base log message
+        log_msg = (f'[{run_tag[:8]}] step {global_step:6d}/{config.num_iterations} '
+                   f'| loss {loss_val:.6f} | avg {avg:.6f} '
+                   f'| lr {lr_now:.2e} | {it_s:.1f} it/s | ETA {eta/60:.0f}m '
+                   f'| src={source_tag}')
+        
+        # Add mixed integrator info if available
+        if loss_components and 'euler_weight' in loss_components:
+            euler_w = loss_components.get('euler_weight', 1.0)
+            euler_l = loss_components.get('euler_loss', 0.0)
+            cn_l = loss_components.get('cn_loss', 0.0)
+            log_msg += f' | ew={euler_w:.3f} el={euler_l:.4f} cn={cn_l:.4f}'
+        
+        print(log_msg)
         sys.stdout.flush()
         
         # Record training loss for convergence plot
         if train_loss_history is not None:
-            train_loss_history.append({'step': global_step, 'train_loss': avg})
+            history_entry = {'step': global_step, 'train_loss': avg}
+            # Add mixed integrator data if available
+            if loss_components and 'euler_weight' in loss_components:
+                history_entry['euler_loss'] = loss_components.get('euler_loss', 0.0)
+                history_entry['cn_loss'] = loss_components.get('cn_loss', 0.0)
+                history_entry['euler_weight'] = loss_components.get('euler_weight', 1.0)
+            train_loss_history.append(history_entry)
 
     if global_step % config.eval_every == 0:
         do_plots = (global_step % (config.eval_every * 5) == 0)
@@ -880,6 +1118,9 @@ def train(config, net, accelerator=None):
             if is_main_process:
                 print(f'  Supervised loss weight: {config.supervised_loss_weight}')
 
+    # Model-evolved GRF generator (for self-training or external pretrained model)
+    model_evolved_generator = None
+    
     if need_online:
         if use_fixed_grf:
             if is_main_process:
@@ -892,6 +1133,51 @@ def train(config, net, accelerator=None):
             if is_main_process:
                 print('Building GRF generator for online data...')
             grf = _make_grf_generator(config, device=device)
+            
+            # Check for model-evolved GRF modes
+            pretrained_path = getattr(config, 'pretrained_model_path', None)
+            self_training_start = getattr(config, 'self_training_start_step', 0)
+            
+            # Warn if both modes are specified (pretrained takes priority)
+            if pretrained_path is not None and self_training_start > 0:
+                if is_main_process:
+                    print(f'[WARNING] Both pretrained_model_path and self_training_start_step are set.')
+                    print(f'  pretrained_model_path takes priority, self_training_start_step will be IGNORED.')
+            
+            # Warn if self_training_start_step >= num_iterations
+            if self_training_start > 0 and self_training_start >= config.num_iterations:
+                if is_main_process:
+                    print(f'[WARNING] self_training_start_step ({self_training_start}) >= num_iterations ({config.num_iterations})')
+                    print(f'  Self-training will never be activated!')
+            
+            # Warn about staged mode + self-training interaction
+            if data_mode == 'staged' and self_training_start > 0:
+                online_warmup = getattr(config, 'online_warmup_steps', 0)
+                if is_main_process:
+                    print(f'[INFO] Using staged mode with self-training:')
+                    print(f'  - Steps 0 to {self_training_start-1}: raw GRF (online phase)')
+                    print(f'  - Steps {self_training_start} to {online_warmup-1}: model-evolved GRF (online phase)')
+                    print(f'  - Steps {online_warmup}+: offline data (self-training NOT used)')
+                    if self_training_start >= online_warmup:
+                        print(f'  [WARNING] self_training_start_step ({self_training_start}) >= online_warmup_steps ({online_warmup})')
+                        print(f'    Self-training will never be activated (offline phase starts first)!')
+            
+            if pretrained_path is not None:
+                # External model mode: load pretrained model and activate immediately
+                if not os.path.exists(pretrained_path):
+                    raise FileNotFoundError(f'Pretrained model not found: {pretrained_path}')
+                model_evolved_generator = _make_pretrained_generator(
+                    grf, pretrained_path, config, device=device, verbose=is_main_process)
+                grf = model_evolved_generator  # Replace GRF with model-evolved generator
+                
+            elif self_training_start > 0:
+                # Self-training mode: use training model's copy
+                # NOTE: We create the generator later after model is on device
+                if is_main_process:
+                    print(f'[Self-Training Mode] Will create generator after model initialization')
+                    print(f'  Activation step: {self_training_start}')
+                # Mark that we need to create self-training generator after model is ready
+                config._need_self_training_generator = True
 
     if is_main_process:
         print(f'Building MHD instance on {device}...')
@@ -907,6 +1193,19 @@ def train(config, net, accelerator=None):
     if accelerator is not None:
         net, optimizer, scheduler = accelerator.prepare(net, optimizer, scheduler)
 
+    # Create self-training generator AFTER model is on device and wrapped
+    # This ensures we copy the correct initial weights
+    need_self_training_gen = getattr(config, '_need_self_training_generator', False)
+    if need_self_training_gen and need_online:
+        # Get unwrapped model for weight copying
+        source_net = accelerator.unwrap_model(net) if accelerator is not None else net
+        model_evolved_generator = _make_self_training_generator(
+            grf, source_net, config, device=device, verbose=is_main_process)
+        grf = model_evolved_generator  # Replace GRF with model-evolved generator
+    # Clean up temporary flag (always, to avoid state leakage)
+    if hasattr(config, '_need_self_training_generator'):
+        del config._need_self_training_generator
+
     train_dt = config.rollout_dt / config.output_dim
     n_substeps_eval = max(1, round(config.dt_data / config.rollout_dt))
     if is_main_process:
@@ -919,6 +1218,17 @@ def train(config, net, accelerator=None):
         elif data_mode == 'alternating':
             print(f'    alternate: {config.alternate_online_steps} online / '
                   f'{config.alternate_offline_steps} offline per cycle')
+        
+        # Mixed integrator info
+        if getattr(config, 'use_mixed_integrator', 0):
+            print(f'  [Mixed Integrator] ENABLED:')
+            print(f'    euler_weight_init={config.euler_weight_init}, '
+                  f'euler_weight_min={config.euler_weight_min}')
+            print(f'    euler_anneal_start={config.euler_anneal_start}, '
+                  f'euler_half_life={config.euler_half_life}')
+        else:
+            print(f'  time_integrator={config.time_integrator}')
+        
         print(f'\n[{run_tag}] Training: {config.num_iterations} iters, '
               f'bs={config.batch_size}, lr={config.lr}')
         print('-' * 60)
@@ -966,8 +1276,39 @@ def train(config, net, accelerator=None):
 
     prev_source = None
 
+    # Self-training configuration
+    self_training_start = getattr(config, 'self_training_start_step', 0)
+    self_training_update_every = getattr(config, 'self_training_update_every', 0)
+    
     while global_step < config.num_iterations:
         source = _get_source(global_step)
+        
+        # === Self-training mode: activation and periodic weight updates ===
+        if model_evolved_generator is not None and not use_fixed_grf:
+            # Check if we need to activate self-training
+            if (not model_evolved_generator.is_active() 
+                and self_training_start > 0 
+                and global_step >= self_training_start):
+                # Update weights from current training model before activation
+                source_net = accelerator.unwrap_model(net) if accelerator is not None else net
+                model_evolved_generator.update_model_weights(source_net)
+                model_evolved_generator.activate()
+                if is_main_process:
+                    print(f'\n[Self-Training] ACTIVATED at step {global_step}')
+                    print(f'  Data will now be: GRF -> Model({self_training_start}) -> evolved state\n')
+                    sys.stdout.flush()
+            
+            # Check if we need to update weights (only for self-training mode, not external model)
+            elif (model_evolved_generator.is_active() 
+                  and self_training_update_every > 0
+                  and self_training_start > 0  # Only self-training mode updates
+                  and global_step > self_training_start
+                  and (global_step - self_training_start) % self_training_update_every == 0):
+                source_net = accelerator.unwrap_model(net) if accelerator is not None else net
+                model_evolved_generator.update_model_weights(source_net)
+                if is_main_process:
+                    print(f'\n[Self-Training] Weights REFRESHED at step {global_step}\n')
+                    sys.stdout.flush()
 
         # Staged mode: reset scheduler at the transition point
         if data_mode == 'staged' and prev_source == 'online' and source == 'offline':
@@ -982,20 +1323,29 @@ def train(config, net, accelerator=None):
                 sys.stdout.flush()
         prev_source = source
 
+        # Compute euler_weight for mixed integrator mode
+        euler_weight = _get_euler_weight(global_step, config)
+
         if source == 'online':
             x_0 = grf(config.batch_size)
             net.train()
-            loss_val = _train_step(net, x_0, rhs_fn, optimizer, scheduler, config, accelerator=accelerator)
+            loss_val, loss_components = _train_step(
+                net, x_0, rhs_fn, optimizer, scheduler, config,
+                accelerator=accelerator, euler_weight=euler_weight)
         else:
             # Offline mode: can use supervised loss if enabled
             if use_supervised and supervised_sampler is not None:
                 x_0, x_target = supervised_sampler.next_batch()
                 net.train()
-                loss_val = _train_step(net, x_0, rhs_fn, optimizer, scheduler, config, x_target, accelerator=accelerator)
+                loss_val, loss_components = _train_step(
+                    net, x_0, rhs_fn, optimizer, scheduler, config,
+                    x_target, accelerator=accelerator, euler_weight=euler_weight)
             else:
                 x_0 = offline_sampler.next_batch().to(device)
                 net.train()
-                loss_val = _train_step(net, x_0, rhs_fn, optimizer, scheduler, config, accelerator=accelerator)
+                loss_val, loss_components = _train_step(
+                    net, x_0, rhs_fn, optimizer, scheduler, config,
+                    accelerator=accelerator, euler_weight=euler_weight)
 
         running_loss += loss_val
         running_count += 1
@@ -1007,14 +1357,15 @@ def train(config, net, accelerator=None):
         # - But main process is still evaluating -> deadlock
         if accelerator is not None and global_step % config.eval_every == 0:
             accelerator.wait_for_everyone()
-        
+
         # Only log and eval on main process
         if is_main_process:
             eval_net = accelerator.unwrap_model(net) if accelerator is not None else net
             best_loss = _log_and_eval(
                 config, eval_net, global_step, loss_val, running_loss, running_count,
                 t_start, eval_data, mhd, best_loss, run_tag, source,
-                eval_history, train_loss_history=train_loss_history, optimizer=optimizer)
+                eval_history, train_loss_history=train_loss_history,
+                optimizer=optimizer, loss_components=loss_components)
         
         # Sync AFTER evaluation so non-main processes wait for main to finish
         if accelerator is not None and global_step % config.eval_every == 0:

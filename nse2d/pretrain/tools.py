@@ -382,3 +382,117 @@ class FixedGRFDataSampler:
     def __call__(self, batch_size):
         """Make it callable like GRF."""
         return self.next_batch(batch_size)
+
+
+# ---------------------------------------------------------------------------
+# Model-evolved GRF data generator for self-training / transfer learning
+# ---------------------------------------------------------------------------
+
+class ModelEvolvedGRFGenerator:
+    """Generate training data by evolving GRF through a model (pretrained or self).
+    
+    This generator produces states that lie closer to the physical manifold compared
+    to raw GRF samples, which may not satisfy PDE constraints.
+    
+    IMPORTANT: Gradient isolation is enforced via three mechanisms:
+    1. Separate model instance (not a reference to training model)
+    2. All parameters have requires_grad=False
+    3. Inference wrapped in torch.no_grad()
+    4. Output tensor is detached
+    
+    Supports two modes:
+    - External model mode: Use a fixed pretrained model (activate immediately)
+    - Self-training mode: Use training model's copy, with dynamic weight updates
+    """
+    
+    def __init__(self, model, grf_generator, rollout_steps=10, device='cpu', verbose=True):
+        """
+        Args:
+            model: OmniFluids2D model instance (will be frozen, no gradients)
+            grf_generator: MHD5FieldGRF instance for generating initial conditions
+            rollout_steps: Number of model inference steps to evolve GRF
+            device: Target device
+            verbose: Whether to print status messages (set False for non-main processes)
+        """
+        if rollout_steps < 1:
+            raise ValueError(f'rollout_steps must be >= 1, got {rollout_steps}')
+        
+        self.model = model
+        self.grf = grf_generator
+        self.rollout_steps = rollout_steps
+        self.device = device
+        self._is_active = False  # Delayed activation support
+        self._update_count = 0   # Track number of weight updates
+        self._verbose = verbose
+        
+        # Freeze model - NO gradients will flow through this model
+        self._freeze_model()
+        
+        if self._verbose:
+            print(f'[ModelEvolvedGRFGenerator] Created: rollout_steps={rollout_steps}, '
+                  f'device={device}, active={self._is_active}')
+    
+    def _freeze_model(self):
+        """Freeze model parameters to prevent gradient flow."""
+        self.model.eval()
+        for param in self.model.parameters():
+            param.requires_grad = False
+    
+    def activate(self):
+        """Activate the generator (start using model-evolved data)."""
+        self._is_active = True
+        if self._verbose:
+            print(f'[ModelEvolvedGRFGenerator] ACTIVATED - now using model-evolved data')
+    
+    def is_active(self):
+        """Check if generator is currently active."""
+        return self._is_active
+    
+    def update_model_weights(self, source_model):
+        """Update internal model weights from source (for self-training mode).
+        
+        Args:
+            source_model: The training model to copy weights from (deep copy)
+        """
+        # state_dict() returns a copy, not a reference
+        self.model.load_state_dict(source_model.state_dict())
+        # Re-freeze after update
+        self._freeze_model()
+        self._update_count += 1
+        if self._verbose:
+            print(f'[ModelEvolvedGRFGenerator] Weights UPDATED (update #{self._update_count})')
+    
+    def __call__(self, batch_size):
+        """Generate training data with full gradient isolation.
+        
+        If not active: returns raw GRF samples
+        If active: returns model-evolved GRF samples (detached)
+        
+        Returns:
+            (batch_size, Nx, Ny, 5) float32 tensor
+        """
+        # 1. Generate GRF random initial conditions
+        x_0 = self.grf(batch_size)  # (B, Nx, Ny, 5)
+        
+        # 2. If not active, return raw GRF
+        if not self._is_active:
+            return x_0
+        
+        # 3. Evolve through model (no gradient tracking)
+        current = x_0
+        with torch.no_grad():
+            for _ in range(self.rollout_steps):
+                # inference=True → output (B, Nx, Ny, 5, 1)
+                out = self.model(current, inference=True)
+                current = out[..., -1]  # Take last frame → (B, Nx, Ny, 5)
+        
+        # 4. Detach to ensure no gradient connection (extra safety)
+        return current.detach()
+    
+    @property
+    def Nx(self):
+        return self.grf.Nx
+    
+    @property
+    def Ny(self):
+        return self.grf.Ny

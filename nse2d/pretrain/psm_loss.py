@@ -47,7 +47,8 @@ def build_mhd_instance(device='cpu', Nx=512, Ny=256):
 
 
 def compute_physics_loss(pred_traj, x_0, rhs_fn, rollout_dt, output_dim,
-                         time_integrator='crank_nicolson', mae_weight=0.0):
+                         time_integrator='crank_nicolson', mae_weight=0.0,
+                         euler_weight=None):
     """Multi-frame physics loss using mhd_sim's RHS.
 
     For each consecutive frame pair in the trajectory, enforce:
@@ -63,15 +64,55 @@ def compute_physics_loss(pred_traj, x_0, rhs_fn, rollout_dt, output_dim,
         rhs_fn: callable (B, Nx, Ny, 5) -> (B, Nx, Ny, 5)
         rollout_dt: total time span covered by output_dim frames
         output_dim: number of predicted frames
-        time_integrator: 'euler' or 'crank_nicolson'
+        time_integrator: 'euler' or 'crank_nicolson' (used when euler_weight is None)
         mae_weight: weight for the additional MAE loss term (default 0 = off)
+        euler_weight: If not None, enables mixed mode:
+            - Computes both Euler and CN losses separately
+            - Returns combined loss = euler_weight * euler_loss + (1 - euler_weight) * cn_loss
+            - Also returns individual losses as dict
 
     Returns:
-        scalar loss
+        If euler_weight is None: scalar loss
+        If euler_weight is not None: (combined_loss, {'euler': euler_loss, 'cn': cn_loss})
     """
     dt = rollout_dt / output_dim
     full_traj = torch.cat([x_0.unsqueeze(-1), pred_traj], dim=-1)
 
+    # Mixed integrator mode: compute both Euler and CN losses separately
+    if euler_weight is not None:
+        total_euler_mse = torch.tensor(0.0, device=x_0.device, dtype=x_0.dtype)
+        total_cn_mse = torch.tensor(0.0, device=x_0.device, dtype=x_0.dtype)
+        
+        for t in range(output_dim):
+            state_t = full_traj[..., t]
+            state_tp1 = full_traj[..., t + 1]
+            time_diff = (state_tp1 - state_t) / dt
+            
+            # Euler target: rhs(t)
+            rhs_t = rhs_fn(state_t)
+            target_euler = rhs_t.detach()
+            total_euler_mse = total_euler_mse + F.mse_loss(time_diff, target_euler)
+            
+            # CN target: (rhs(t) + rhs(t+1)) / 2
+            # Only compute rhs_tp1 if we need CN loss (euler_weight < 1)
+            if euler_weight < 1.0 - 1e-6:
+                rhs_tp1 = rhs_fn(state_tp1)
+                target_cn = ((rhs_t + rhs_tp1) / 2.0).detach()
+                total_cn_mse = total_cn_mse + F.mse_loss(time_diff, target_cn)
+        
+        euler_loss = total_euler_mse / output_dim
+        
+        if euler_weight >= 1.0 - 1e-6:
+            # Pure Euler mode
+            cn_loss = torch.tensor(0.0, device=x_0.device, dtype=x_0.dtype)
+            combined_loss = euler_loss
+        else:
+            cn_loss = total_cn_mse / output_dim
+            combined_loss = euler_weight * euler_loss + (1.0 - euler_weight) * cn_loss
+        
+        return combined_loss, {'euler': euler_loss.item(), 'cn': cn_loss.item()}
+
+    # Original single-integrator mode
     total_mse = torch.tensor(0.0, device=x_0.device, dtype=x_0.dtype)
     total_mae = torch.tensor(0.0, device=x_0.device, dtype=x_0.dtype)
 

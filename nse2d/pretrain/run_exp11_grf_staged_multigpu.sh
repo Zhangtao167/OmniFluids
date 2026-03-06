@@ -1,48 +1,49 @@
 #!/bin/bash
 # =============================================================================
-# Exp4: Fixed GRF Overfitting Test
-# Train on a single fixed GRF sample to test model fitting capacity
+# Exp11: GRF Online Warmup -> Offline Staged Training (Multi-GPU, 4 GPUs)
+# Stage 1: 100000 steps online (GRF, physics loss only)
+# Stage 2: 150000 steps offline (mhd_sim data, physics loss only)
+# Total: 250000 steps
+# Eval: mhd_sim test set (trajectory rollout L2 error)
 # Radial mask ON, no abs constraint on n/Ti
-# Evaluation: mhd_sim test set (for comparison with other experiments)
 # =============================================================================
 
 set -e
 
-source /opt/conda/bin/activate
-conda activate /zhangtao/envs/rae || true
 cd /zhangtao/project2026/OmniFluids/nse2d/pretrain
 
-EXP_NAME="exp4_fixed_grf_overfitting"
-GPU_ID=${1:-0}
-
-# Data paths: DATA_PATH for GRF scale stats, EVAL_DATA_PATH for test evaluation
 DATA_PATH="/zhangtao/project2026/OmniFluids/nse2d/data/qruio_data/5field_mhd_batch/data/5field_mhd_dataset.pt"
 EVAL_DATA_PATH="/zhangtao/project2026/OmniFluids/nse2d/data/qruio_data/5field_mhd_batch_test/data/5field_mhd_dataset.pt"
 
+EXP_NAME="exp11_grf_staged_multigpu"
+GPU_IDS=${1:-"0,1,2,3"}
+NUM_GPUS=$(echo "$GPU_IDS" | tr ',' '\n' | wc -l)
+
 echo "========================================================================="
-echo "  Exp4: Fixed GRF Overfitting Test"
+echo "  Exp11: GRF Staged Training (Multi-GPU via Accelerate)"
 echo "========================================================================="
-echo "  GPU: cuda:$GPU_ID"
-echo "  Training Data: Single FIXED GRF sample (seed=42)"
-echo "  Eval Data: mhd_sim test set (for fair comparison)"
-echo "  Mode: online (using GRF generator)"
+echo "  GPU_IDS: $GPU_IDS"
+echo "  NUM_GPUS: $NUM_GPUS"
+echo "  Stage 1: 100000 steps online (GRF, physics loss)"
+echo "  Stage 2: 150000 steps offline (mhd_sim data, physics loss)"
+echo "  Total: 250000 steps"
+echo "  Eval: mhd_sim test set (trajectory rollout L2)"
 echo "  Radial mask: ON (x=[180,330])"
-echo "  Abs constraint: OFF"
-echo "  Physics Loss: ENABLED (weight=1.0)"
-echo "  Supervised Loss: DISABLED"
-echo "  Expected: training loss converges, but eval error may not decrease"
 echo "========================================================================="
 echo ""
 
-python main.py \
+CUDA_VISIBLE_DEVICES=$GPU_IDS /zhangtao/envs/rae/bin/accelerate launch \
+    --num_processes=$NUM_GPUS \
+    --mixed_precision=no \
+    --main_process_port=29501 \
+    main.py \
     --mode train \
-    --device "cuda:$GPU_ID" \
     --exp_name "$EXP_NAME" \
     --data_path "$DATA_PATH" \
     --eval_data_path "$EVAL_DATA_PATH" \
-    --data_mode "online" \
-    --is_grf_overfitting_test 1 \
-    --grf_overfitting_seed 42 \
+    --data_mode "staged" \
+    --online_warmup_steps 100000 \
+    --is_grf_overfitting_test 0 \
     --physics_loss_weight 1.0 \
     --supervised_loss_weight 0.0 \
     --mae_weight 0.0 \
@@ -60,9 +61,10 @@ python main.py \
     --time_integrator crank_nicolson \
     --input_noise_scale 0.0 \
     --lr 0.002 \
-    --batch_size 4 \
-    --num_iterations 100000 \
-    --log_every 100 \
-    --eval_every 500 \
+    --batch_size 10 \
+    --num_iterations 250000 \
+    --log_every 500 \
+    --eval_every 5000 \
     --eval_rollout_steps 10 \
-    --seed 42
+    --seed 42 \
+    --use_accelerate 1
