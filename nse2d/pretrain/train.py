@@ -15,8 +15,9 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
 from tools import (load_mhd5_snapshots, load_mhd5_trajectories, MHD5FieldGRF, 
-                   FixedGRFDataSampler, ModelEvolvedGRFGenerator)
-from psm_loss import build_mhd_instance, make_mhd5_rhs_fn, compute_physics_loss
+                   FixedGRFDataSampler, ModelEvolvedGRFGenerator,
+                   compute_metrics_and_visualize)
+from psm_loss import build_mhd_instance, make_mhd5_rhs_fn, compute_physics_loss, dealias_state
 
 # Multi-GPU support via Accelerate
 try:
@@ -293,7 +294,7 @@ def evaluate(config, net, eval_data, mhd, n_rollout_steps=10,
     results = {
         'rel_l2_total': rel_l2_total,
         'rel_l2_per_field': rel_l2_per_field,
-        'mean_rel_l2': np.mean(rel_l2_total),
+        'mean_rel_l2': float(np.mean(rel_l2_total)),  # Convert to Python float for JSON
         'n_steps': n_steps,
         'n_substeps': n_substeps,
     }
@@ -309,12 +310,28 @@ def evaluate(config, net, eval_data, mhd, n_rollout_steps=10,
         run_dir = getattr(config, 'run_dir',
                           os.path.join('results', config.exp_name,
                                        getattr(config, 'run_tag', config.exp_name)))
-        vis_dir = os.path.join(run_dir, 'vis')
-        save_eval_plots(pred_traj, gt, rel_l2_total, rel_l2_per_field,
-                        vis_dir, tag=step_tag,
-                        time_start=config.time_start,
-                        rollout_dt=config.rollout_dt,
-                        n_substeps=n_substeps)
+        # Create step-specific subdirectory
+        vis_dir = os.path.join(run_dir, 'vis', step_tag)
+        os.makedirs(vis_dir, exist_ok=True)
+        
+        # Convert to (B, T, Nx, Ny, C) format for compute_metrics_and_visualize
+        gt_for_vis = gt.permute(0, 1, 3, 4, 2).cpu()  # (B, T, Nx, Ny, 5)
+        pred_for_vis = pred_traj.permute(0, 1, 3, 4, 2).cpu()  # (B, T, Nx, Ny, 5)
+        
+        # Use compute_metrics_and_visualize for consistent visualization
+        compute_metrics_and_visualize(
+            gt_traj=gt_for_vis,
+            pred_traj=pred_for_vis,
+            metric_step_list=[1, 3, 5, 10] if n_steps >= 10 else list(range(1, n_steps + 1)),
+            plot_step_list=[0, 1, 3, 5, 10] if n_steps >= 10 else list(range(n_steps + 1)),
+            visualize=True,
+            save_dir=vis_dir,
+            time_start=config.time_start,
+            dt_data=config.dt_data,
+            sample_idx=0,
+            eval_key=step_tag,
+        )
+        print(f'  Plots saved to {vis_dir}/')
 
     net.train()
     return results
@@ -520,13 +537,20 @@ def _load_supervised_pairs(config):
 
 
 class _SupervisedOfflineSampler:
-    """Infinite iterator over supervised pairs, auto-resets on exhaustion."""
-    def __init__(self, pairs, batch_size, device='cpu', is_overfitting=False):
+    """Infinite iterator over supervised pairs, auto-resets on exhaustion.
+
+    Optionally converts each real pair (x_t, x_{t+1}) into a random linear-
+    interpolation one-step pseudo-pair, so a 0.1s model can be trained from
+    1.0s-spaced data without storing all intermediate states.
+    """
+    def __init__(self, pairs, batch_size, device='cpu', is_overfitting=False,
+                 interp_steps=1):
         self.pairs = pairs
         self.device = device
         self.n_pairs = len(pairs)
         self.batch_size = batch_size  # Keep batch_size unchanged
         self.is_overfitting = is_overfitting
+        self.interp_steps = max(1, int(interp_steps))
         if is_overfitting:
             print(f'[OVERFITTING TEST] Supervised sampler: {self.n_pairs} pairs, '
                   f'batch_size={batch_size} (random sampling with replacement)')
@@ -552,8 +576,18 @@ class _SupervisedOfflineSampler:
             batch_pairs = self.pairs[self._idx:self._idx + self.batch_size]
             self._idx += self.batch_size
         
-        x_0_list = [p[0] for p in batch_pairs]
-        x_target_list = [p[1] for p in batch_pairs]
+        if self.interp_steps > 1:
+            x_0_list = []
+            x_target_list = []
+            for x_start, x_end in batch_pairs:
+                sub_idx = random.randrange(self.interp_steps)
+                alpha_0 = float(sub_idx) / float(self.interp_steps)
+                alpha_1 = float(sub_idx + 1) / float(self.interp_steps)
+                x_0_list.append(torch.lerp(x_start, x_end, alpha_0))
+                x_target_list.append(torch.lerp(x_start, x_end, alpha_1))
+        else:
+            x_0_list = [p[0] for p in batch_pairs]
+            x_target_list = [p[1] for p in batch_pairs]
         
         x_0 = torch.stack(x_0_list).to(self.device)
         x_target = torch.stack(x_target_list).to(self.device)
@@ -770,21 +804,31 @@ def _get_euler_weight(step, config):
 # Unified training step
 # ---------------------------------------------------------------------------
 
-def _train_step(net, x_0, rhs_fn, optimizer, scheduler, config, x_target=None, accelerator=None, euler_weight=None):
+def _train_step(net, x_0, rhs_fn, optimizer, scheduler, config, x_target=None, 
+                accelerator=None, euler_weight=None, mhd=None):
     """Execute one training step. Returns (loss_value, loss_components).
     
     Args:
         x_target: Optional target state for supervised loss. If provided,
-                  computes MSE/MAE between pred[..., -1] and x_target.
+                  computes MSE/MAE between autoregressive prediction and x_target.
+                  When supervised_n_substeps > 1, the model is called multiple times
+                  autoregressively to cover sup_n_substeps * rollout_dt time span.
         accelerator: Optional Accelerator instance for multi-GPU training.
         euler_weight: If not None, use mixed integrator mode with this weight.
+        mhd: FiveFieldMHD instance for dealias_input (required if dealias_input=True).
     
     Returns:
         (loss_value, loss_components): loss value and dict with component losses
     """
+    x_ref = x_0
     noise_scale = getattr(config, 'input_noise_scale', 0.0)
     if noise_scale > 0:
         x_0 = x_0 + noise_scale * torch.randn_like(x_0)
+    
+    # Dealias input to prevent aliasing in nonlinear RHS terms
+    if getattr(config, 'dealias_input', True) and mhd is not None:
+        x_0 = dealias_state(mhd, x_0)
+    
     pred_traj = net(x_0)
 
     # Physics loss (PDE loss)
@@ -822,35 +866,90 @@ def _train_step(net, x_0, rhs_fn, optimizer, scheduler, config, x_target=None, a
     
     # Supervised loss (only when target is provided)
     if x_target is not None:
-        # Use the last predicted frame as the next state prediction
-        pred_next = pred_traj[..., -1]  # (B, Nx, Ny, 5)
-        
         sup_weight = getattr(config, 'supervised_loss_weight', 0.0)
-        sup_mse_weight = getattr(config, 'supervised_mse_weight', 1.0)
-        sup_mae_weight = getattr(config, 'supervised_mae_weight', 0.0)
         
         if sup_weight > 0:
-            sup_loss, sup_metrics = _compute_supervised_loss(
-                pred_next, x_target, 
-                mse_weight=sup_mse_weight,
-                mae_weight=sup_mae_weight)
+            # Get n_substeps for autoregressive rollout to match dt_data
+            sup_n_substeps = getattr(config, 'supervised_n_substeps', 1)
+            use_interp = bool(getattr(config, 'supervised_use_interpolation', 0))
+            sup_mse_weight = getattr(config, 'supervised_mse_weight', 1.0)
+            sup_mae_weight = getattr(config, 'supervised_mae_weight', 0.0)
+            
+            if sup_n_substeps > 1 and use_interp:
+                # Supervise each 0.1-style autoregressive substep using a linearly
+                # interpolated target between the two data frames.
+                current = x_0
+                total_sup_loss = torch.tensor(0.0, device=pred_traj.device, dtype=pred_traj.dtype)
+                total_sup_mse = 0.0
+                total_sup_mae = 0.0
+
+                for sub_idx in range(sup_n_substeps):
+                    if sub_idx == 0:
+                        pred_next = pred_traj[..., -1]
+                    else:
+                        pred_sub = net(current)
+                        pred_next = pred_sub[..., -1]
+
+                    alpha = float(sub_idx + 1) / float(sup_n_substeps)
+                    interp_target = torch.lerp(x_ref, x_target, alpha)
+                    step_loss, step_metrics = _compute_supervised_loss(
+                        pred_next, interp_target,
+                        mse_weight=sup_mse_weight,
+                        mae_weight=sup_mae_weight)
+                    total_sup_loss = total_sup_loss + step_loss
+                    total_sup_mse += step_metrics['mse']
+                    total_sup_mae += step_metrics['mae']
+                    current = pred_next
+
+                sup_loss = total_sup_loss / sup_n_substeps
+                sup_metrics = {
+                    'mse': total_sup_mse / sup_n_substeps,
+                    'mae': total_sup_mae / sup_n_substeps,
+                }
+                pred_next = current
+            elif sup_n_substeps > 1:
+                # Autoregressive rollout: iterate model sup_n_substeps times
+                # This covers sup_n_substeps * rollout_dt time span
+                current = x_0
+                for sub_idx in range(sup_n_substeps):
+                    if sub_idx == 0:
+                        current = pred_traj[..., -1]
+                    else:
+                        pred_sub = net(current)
+                        current = pred_sub[..., -1]
+                pred_next = current  # (B, Nx, Ny, 5) at t + sup_n_substeps * rollout_dt
+                sup_loss, sup_metrics = _compute_supervised_loss(
+                    pred_next, x_target,
+                    mse_weight=sup_mse_weight,
+                    mae_weight=sup_mae_weight)
+            else:
+                # Single step: use last frame from initial forward pass
+                # Prediction is at t + rollout_dt
+                pred_next = pred_traj[..., -1]  # (B, Nx, Ny, 5)
+                sup_loss, sup_metrics = _compute_supervised_loss(
+                    pred_next, x_target,
+                    mse_weight=sup_mse_weight,
+                    mae_weight=sup_mae_weight)
             total_loss = total_loss + sup_weight * sup_loss
             loss_components['sup'] = sup_loss.item()
             loss_components['sup_mse'] = sup_metrics['mse']
             loss_components['sup_mae'] = sup_metrics['mae']
+            loss_components['sup_n_substeps'] = sup_n_substeps
+            loss_components['sup_interp'] = float(use_interp and sup_n_substeps > 1)
 
     # Backward pass: use accelerator if available
     if accelerator is not None:
         accelerator.backward(total_loss)
     else:
         total_loss.backward()
-    
+
     if config.grad_clip is not None:
         torch.nn.utils.clip_grad_norm_(net.parameters(), config.grad_clip)
+
     optimizer.step()
     optimizer.zero_grad(set_to_none=True)
     scheduler.step()
-    
+
     return total_loss.item(), loss_components
 
 
@@ -858,8 +957,15 @@ def _train_step(net, x_0, rhs_fn, optimizer, scheduler, config, x_target=None, a
 # Convergence curve (updated after each evaluation)
 # ---------------------------------------------------------------------------
 
-def _plot_convergence(eval_history, save_path, train_loss_history=None):
+def _plot_convergence(eval_history, save_path, train_loss_history=None, 
+                      eval_grf_history=None):
     """Plot evaluation and training loss vs training step.
+    
+    Args:
+        eval_history: list of dicts with 'step' and 'mean_rel_l2' for MHD test set
+        save_path: path to save the plot
+        train_loss_history: list of dicts with training loss info
+        eval_grf_history: optional list of dicts for GRF test set evaluation
     
     If mixed integrator is used, also plots Euler loss, CN loss, and euler_weight.
     """
@@ -883,10 +989,19 @@ def _plot_convergence(eval_history, save_path, train_loss_history=None):
     else:
         fig, ax = plt.subplots(figsize=(10, 5))
     
-    # Plot evaluation loss
-    ax.plot(steps, mean_l2, 'b-o', markersize=3, label='eval loss')
+    # Plot MHD test set evaluation loss
+    ax.plot(steps, mean_l2, 'b-o', markersize=3, label='eval L2 (MHD)')
     ax.plot(steps[best_idx], mean_l2[best_idx], 'r*', markersize=12,
-            label=f'best={mean_l2[best_idx]:.6f} @ step {steps[best_idx]}')
+            label=f'best MHD={mean_l2[best_idx]:.6f} @ {steps[best_idx]}')
+    
+    # Plot GRF test set evaluation loss if available
+    if eval_grf_history and len(eval_grf_history) > 0:
+        grf_steps = [h['step'] for h in eval_grf_history]
+        grf_l2 = [h['mean_rel_l2'] for h in eval_grf_history]
+        grf_best_idx = int(np.argmin(grf_l2))
+        ax.plot(grf_steps, grf_l2, 'c-s', markersize=3, label='eval L2 (GRF)')
+        ax.plot(grf_steps[grf_best_idx], grf_l2[grf_best_idx], 'm*', markersize=10,
+                label=f'best GRF={grf_l2[grf_best_idx]:.6f} @ {grf_steps[grf_best_idx]}')
     
     # Plot training loss if available
     if train_loss_history and len(train_loss_history) > 0:
@@ -899,7 +1014,7 @@ def _plot_convergence(eval_history, save_path, train_loss_history=None):
             euler_losses = [h.get('euler_loss', 0) for h in train_loss_history]
             cn_losses = [h.get('cn_loss', 0) for h in train_loss_history]
             ax.plot(train_steps, euler_losses, 'm-', alpha=0.5, linewidth=1, label='euler loss')
-            ax.plot(train_steps, cn_losses, 'c-', alpha=0.5, linewidth=1, label='cn loss')
+            ax.plot(train_steps, cn_losses, 'y-', alpha=0.5, linewidth=1, label='cn loss')
             
             # Plot euler_weight on secondary axis
             euler_weights = [h.get('euler_weight', 1.0) for h in train_loss_history]
@@ -920,6 +1035,8 @@ def _plot_convergence(eval_history, save_path, train_loss_history=None):
     
     # Use log scale if loss varies significantly
     all_values = mean_l2[:]
+    if eval_grf_history:
+        all_values.extend([h['mean_rel_l2'] for h in eval_grf_history])
     if train_loss_history:
         all_values.extend([h['train_loss'] for h in train_loss_history])
     if len(all_values) > 1 and max(all_values) / max(min(all_values), 1e-10) > 10:
@@ -937,15 +1054,19 @@ def _plot_convergence(eval_history, save_path, train_loss_history=None):
 def _log_and_eval(config, net, global_step, loss_val, running_loss,
                   running_count, t_start, eval_data, mhd,
                   best_loss, run_tag, source_tag, eval_history,
-                  train_loss_history=None, optimizer=None, loss_components=None):
+                  train_loss_history=None, optimizer=None, loss_components=None,
+                  eval_grf_data=None, eval_grf_history=None):
     """Handle periodic logging and evaluation. Returns updated best_loss.
     
-    Evaluation always uses mhd_sim test set for fair comparison, regardless of training data source.
+    Evaluates on both MHD test set and GRF test set (if provided).
     
     Args:
+        eval_data: MHD simulation test data (required)
         train_loss_history: list to append training loss for convergence plot
         optimizer: optimizer instance (required for lr logging in multi-GPU mode)
         loss_components: dict with individual loss components (euler_loss, cn_loss, euler_weight)
+        eval_grf_data: optional GRF test data for additional evaluation
+        eval_grf_history: optional list to append GRF evaluation results
     """
     if global_step % config.log_every == 0:
         avg = running_loss / max(running_count, 1)
@@ -983,12 +1104,13 @@ def _log_and_eval(config, net, global_step, loss_val, running_loss,
     if global_step % config.eval_every == 0:
         do_plots = (global_step % (config.eval_every * 5) == 0)
         
-        # Always use mhd_sim test set for fair comparison
+        # === Evaluate on MHD test set ===
+        print(f'  [Eval MHD] step {global_step}:')
         eval_results = evaluate(
             config, net, eval_data, mhd,
             n_rollout_steps=config.eval_rollout_steps,
             save_plots=do_plots,
-            step_tag=f'step_{global_step}')
+            step_tag=f'step_{global_step}_mhd')
 
         current_loss = eval_results['mean_rel_l2']
         if current_loss < best_loss:
@@ -1001,7 +1123,7 @@ def _log_and_eval(config, net, global_step, loss_val, running_loss,
                 'best_loss': best_loss,
                 'eval_results': eval_results,
             }, save_path)
-            print(f'  -> New best: {save_path} (loss={best_loss:.6f})')
+            print(f'  -> New best (MHD): {save_path} (L2={best_loss:.6f})')
 
         torch.save({
             'model_state_dict': net.state_dict(),
@@ -1010,9 +1132,36 @@ def _log_and_eval(config, net, global_step, loss_val, running_loss,
             'best_loss': best_loss,
         }, os.path.join(config.run_dir, 'model', f'latest-{run_tag}.pt'))
 
+        # Save intermediate checkpoint at specified intervals
+        ckpt_every = getattr(config, 'checkpoint_every', 0)
+        if ckpt_every > 0 and global_step % ckpt_every == 0:
+            ckpt_path = os.path.join(config.run_dir, 'model', f'step_{global_step}-{run_tag}.pt')
+            torch.save({
+                'model_state_dict': net.state_dict(),
+                'config': vars(config),
+                'step': global_step,
+                'best_loss': best_loss,
+                'eval_results': eval_results,
+            }, ckpt_path)
+            print(f'  -> Saved intermediate checkpoint: {ckpt_path}')
+
         eval_history.append({'step': global_step, 'mean_rel_l2': current_loss})
+        
+        # === Evaluate on GRF test set (if available) ===
+        if eval_grf_data is not None and eval_grf_history is not None:
+            print(f'  [Eval GRF] step {global_step}:')
+            grf_results = evaluate(
+                config, net, eval_grf_data, mhd,
+                n_rollout_steps=config.eval_rollout_steps,
+                save_plots=do_plots,
+                step_tag=f'step_{global_step}_grf')
+            grf_loss = grf_results['mean_rel_l2']
+            eval_grf_history.append({'step': global_step, 'mean_rel_l2': grf_loss})
+            print(f'  [Summary] MHD L2={current_loss:.6f}, GRF L2={grf_loss:.6f}')
+        
+        # Update convergence plot with both histories
         conv_path = os.path.join(config.run_dir, 'vis', 'convergence.png')
-        _plot_convergence(eval_history, conv_path, train_loss_history)
+        _plot_convergence(eval_history, conv_path, train_loss_history, eval_grf_history)
 
         net.train()
         sys.stdout.flush()
@@ -1083,6 +1232,28 @@ def train(config, net, accelerator=None):
             single_trajectory=False,
             traj_idx=0)
     
+    # Load GRF test set if specified
+    eval_grf_data_path = getattr(config, 'eval_grf_data_path', '')
+    eval_grf_data = None
+    if eval_grf_data_path and os.path.exists(eval_grf_data_path):
+        if is_main_process:
+            print(f'Pre-loading GRF test set: {eval_grf_data_path}')
+        # GRF test set uses the same format as mhd_sim data
+        grf_file = os.path.join(eval_grf_data_path, 'grf_testset.pt') if os.path.isdir(eval_grf_data_path) else eval_grf_data_path
+        if os.path.exists(grf_file):
+            eval_grf_data, grf_meta = load_mhd5_trajectories(
+                grf_file, time_start=config.time_start, time_end=config.time_end,
+                dt_data=config.dt_data,
+                single_trajectory=False,
+                traj_idx=0)
+            if is_main_process:
+                print(f'  GRF test set loaded: {eval_grf_data.shape}')
+        else:
+            if is_main_process:
+                print(f'  WARNING: GRF test file not found: {grf_file}')
+    elif eval_grf_data_path and is_main_process:
+        print(f'  WARNING: eval_grf_data_path set but path does not exist: {eval_grf_data_path}')
+    
     # Alias for backward compatibility in training data loading
     is_overfitting = is_sim_overfitting
 
@@ -1113,10 +1284,23 @@ def train(config, net, accelerator=None):
             if is_main_process:
                 print('Loading supervised (x_t, x_{t+1}) pairs for offline training...')
             sup_pairs, sup_meta = _load_supervised_pairs(config)
+            pair_interp_steps = getattr(config, 'supervised_pair_interp_steps', 1)
             supervised_sampler = _SupervisedOfflineSampler(
-                sup_pairs, config.batch_size, device=device, is_overfitting=is_overfitting)
+                sup_pairs, config.batch_size, device=device,
+                is_overfitting=is_overfitting, interp_steps=pair_interp_steps)
             if is_main_process:
+                sup_n_substeps = getattr(config, 'supervised_n_substeps', 1)
+                use_interp = bool(getattr(config, 'supervised_use_interpolation', 0))
+                print(f'  Supervised pair interpolation steps: {pair_interp_steps}')
+                expected_n_substeps = max(1, round(config.dt_data / config.rollout_dt))
                 print(f'  Supervised loss weight: {config.supervised_loss_weight}')
+                print(f'  Supervised n_substeps: {sup_n_substeps} '
+                      f'(expected {expected_n_substeps} to match dt_data={config.dt_data}s)')
+                print(f'  Supervised interpolation: {use_interp}')
+                if sup_n_substeps != expected_n_substeps:
+                    print(f'  [WARNING] supervised_n_substeps ({sup_n_substeps}) != '
+                          f'expected ({expected_n_substeps}). '
+                          f'Training/eval time scales may be mismatched!')
 
     # Model-evolved GRF generator (for self-training or external pretrained model)
     model_evolved_generator = None
@@ -1182,7 +1366,11 @@ def train(config, net, accelerator=None):
     if is_main_process:
         print(f'Building MHD instance on {device}...')
     mhd = build_mhd_instance(device=device, Nx=config.Nx, Ny=config.Ny)
-    rhs_fn = make_mhd5_rhs_fn(mhd, model_dtype=torch.float32)
+    dealias_rhs = bool(getattr(config, 'dealias_rhs', False))
+    rhs_fn = make_mhd5_rhs_fn(mhd, model_dtype=torch.float32, dealias=dealias_rhs)
+    if is_main_process:
+        dealias_input = bool(getattr(config, 'dealias_input', True))
+        print(f'  Dealiasing: dealias_input={dealias_input}, dealias_rhs={dealias_rhs}')
 
     net = net.to(device)
     optimizer = optim.Adam(net.parameters(), lr=config.lr,
@@ -1234,17 +1422,32 @@ def train(config, net, accelerator=None):
         print('-' * 60)
         sys.stdout.flush()
 
-    # --- Initial evaluation (always use mhd_sim test set for fair comparison) ---
+    # --- Initial evaluation (on both MHD and GRF test sets) ---
     # Only run evaluation on main process to avoid duplicate computation
+    init_grf_loss = float('inf')
     if is_main_process:
         print('Initial evaluation (step 0) ...')
         # For DDP, unwrap model for evaluation
         eval_net = accelerator.unwrap_model(net) if accelerator is not None else net
+        
+        # Evaluate on MHD test set
+        print('  [Eval MHD] step 0:')
         init_results = evaluate(
             config, eval_net, eval_data, mhd,
             n_rollout_steps=config.eval_rollout_steps,
-            save_plots=True, step_tag='step_0')
+            save_plots=True, step_tag='step_0_mhd')
         best_loss = init_results['mean_rel_l2']
+        
+        # Evaluate on GRF test set if available
+        if eval_grf_data is not None:
+            print('  [Eval GRF] step 0:')
+            init_grf_results = evaluate(
+                config, eval_net, eval_grf_data, mhd,
+                n_rollout_steps=config.eval_rollout_steps,
+                save_plots=True, step_tag='step_0_grf')
+            init_grf_loss = init_grf_results['mean_rel_l2']
+            print(f'  [Summary] MHD L2={best_loss:.6f}, GRF L2={init_grf_loss:.6f}')
+        
         sys.stdout.flush()
     else:
         best_loss = float('inf')
@@ -1254,6 +1457,7 @@ def train(config, net, accelerator=None):
         accelerator.wait_for_everyone()
     
     eval_history = [{'step': 0, 'mean_rel_l2': best_loss}]
+    eval_grf_history = [{'step': 0, 'mean_rel_l2': init_grf_loss}] if eval_grf_data is not None else None
     train_loss_history = []  # Track training loss for convergence plot
 
     t_start = time.time()
@@ -1314,6 +1518,9 @@ def train(config, net, accelerator=None):
         if data_mode == 'staged' and prev_source == 'online' and source == 'offline':
             remaining = config.num_iterations - global_step
             scheduler = _make_scheduler(optimizer, config.lr, remaining)
+            # Wrap with accelerator if using multi-GPU (must be done on all processes)
+            if accelerator is not None:
+                scheduler = accelerator.prepare(scheduler)
             if is_main_process:
                 print(f'\n[{run_tag[:8]}] === STAGED SWITCH: online -> offline at step '
                       f'{global_step} (remaining {remaining} steps, lr scheduler reset) ===\n')
@@ -1331,7 +1538,7 @@ def train(config, net, accelerator=None):
             net.train()
             loss_val, loss_components = _train_step(
                 net, x_0, rhs_fn, optimizer, scheduler, config,
-                accelerator=accelerator, euler_weight=euler_weight)
+                accelerator=accelerator, euler_weight=euler_weight, mhd=mhd)
         else:
             # Offline mode: can use supervised loss if enabled
             if use_supervised and supervised_sampler is not None:
@@ -1339,13 +1546,13 @@ def train(config, net, accelerator=None):
                 net.train()
                 loss_val, loss_components = _train_step(
                     net, x_0, rhs_fn, optimizer, scheduler, config,
-                    x_target, accelerator=accelerator, euler_weight=euler_weight)
+                    x_target, accelerator=accelerator, euler_weight=euler_weight, mhd=mhd)
             else:
                 x_0 = offline_sampler.next_batch().to(device)
                 net.train()
                 loss_val, loss_components = _train_step(
                     net, x_0, rhs_fn, optimizer, scheduler, config,
-                    accelerator=accelerator, euler_weight=euler_weight)
+                    accelerator=accelerator, euler_weight=euler_weight, mhd=mhd)
 
         running_loss += loss_val
         running_count += 1
@@ -1365,13 +1572,14 @@ def train(config, net, accelerator=None):
                 config, eval_net, global_step, loss_val, running_loss, running_count,
                 t_start, eval_data, mhd, best_loss, run_tag, source,
                 eval_history, train_loss_history=train_loss_history,
-                optimizer=optimizer, loss_components=loss_components)
+                optimizer=optimizer, loss_components=loss_components,
+                eval_grf_data=eval_grf_data, eval_grf_history=eval_grf_history)
         
         # Sync AFTER evaluation so non-main processes wait for main to finish
         if accelerator is not None and global_step % config.eval_every == 0:
             accelerator.wait_for_everyone()
 
-        if is_main_process and global_step % config.log_every == 0:
+        if global_step % config.log_every == 0:
             running_loss = 0.0
             running_count = 0
 
@@ -1387,20 +1595,38 @@ def train(config, net, accelerator=None):
         else:
             print(f'  WARNING: best checkpoint not found at {best_path}, using latest weights')
 
-        # Final evaluation always uses mhd_sim test set
+        # Final evaluation on MHD test set
+        print(f'  [Final Eval MHD]:')
         final_results = evaluate(
             config, eval_net, eval_data, mhd,
             n_rollout_steps=config.eval_rollout_steps,
-            save_plots=True, step_tag=f'final-{run_tag}')
+            save_plots=True, step_tag=f'final-{run_tag}_mhd')
 
-        results_path = os.path.join(config.run_dir, f'eval-{run_tag}.json')
+        results_path = os.path.join(config.run_dir, f'eval-{run_tag}_mhd.json')
         with open(results_path, 'w') as f:
             json.dump(final_results, f, indent=2)
-        print(f'Results saved to {results_path}')
+        print(f'  MHD results saved to {results_path}')
+        
+        # Final evaluation on GRF test set if available
+        if eval_grf_data is not None:
+            print(f'  [Final Eval GRF]:')
+            final_grf_results = evaluate(
+                config, eval_net, eval_grf_data, mhd,
+                n_rollout_steps=config.eval_rollout_steps,
+                save_plots=True, step_tag=f'final-{run_tag}_grf')
+            
+            grf_results_path = os.path.join(config.run_dir, f'eval-{run_tag}_grf.json')
+            with open(grf_results_path, 'w') as f:
+                json.dump(final_grf_results, f, indent=2)
+            print(f'  GRF results saved to {grf_results_path}')
+            
+            print(f'\n  === Final Summary ===')
+            print(f'  MHD Test L2: {final_results["mean_rel_l2"]:.6f}')
+            print(f'  GRF Test L2: {final_grf_results["mean_rel_l2"]:.6f}')
 
         total_time = time.time() - t_start
         print(f'Total training time: {total_time/3600:.1f}h ({total_time/60:.0f}m)')
-        sys.stdout.flush()
+    sys.stdout.flush()
     
     # Wait for all processes to finish
     if accelerator is not None:

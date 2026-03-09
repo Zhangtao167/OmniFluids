@@ -233,6 +233,8 @@ if __name__ == "__main__":
                         help='Training data path')
     parser.add_argument('--eval_data_path', type=str, default=DEFAULT_EVAL_DATA,
                         help='Evaluation/test data path (separate from training)')
+    parser.add_argument('--eval_grf_data_path', type=str, default='',
+                        help='Optional: GRF test set path for additional evaluation')
     parser.add_argument('--time_start', type=float, default=250.0)
     parser.add_argument('--time_end', type=float, default=300.0)
     parser.add_argument('--dt_data', type=float, default=1.0)
@@ -256,6 +258,10 @@ if __name__ == "__main__":
                         help='Model inference dt (= mhd_sim delta_t)')
     parser.add_argument('--time_integrator', type=str, default='crank_nicolson',
                         choices=['euler', 'crank_nicolson'])
+    parser.add_argument('--dealias_input', type=int, default=1,
+                        help='Dealias input before model forward (default=1, prevents aliasing)')
+    parser.add_argument('--dealias_rhs', type=int, default=0,
+                        help='Dealias inside RHS function (default=0, redundant if dealias_input=1)')
     parser.add_argument('--input_noise_scale', type=float, default=0.001,
                         help='Scale of additive Gaussian noise on training input')
     parser.add_argument('--mae_weight', type=float, default=0.0,
@@ -266,6 +272,16 @@ if __name__ == "__main__":
                         help='MSE weight within supervised loss (default=1.0)')
     parser.add_argument('--supervised_mae_weight', type=float, default=0.0,
                         help='MAE weight within supervised loss (default=0.0)')
+    parser.add_argument('--supervised_n_substeps', type=int, default=1,
+                        help='Number of autoregressive model calls in supervised training. '
+                             'Set to round(dt_data/rollout_dt) to match evaluation (e.g., 10). '
+                             'Default=1 means model predicts rollout_dt, target is dt_data apart.')
+    parser.add_argument('--supervised_use_interpolation', type=int, default=0,
+                        help='1=for supervised_n_substeps>1, supervise each substep against '
+                             'a linearly interpolated target between x_t and x_{t+1}')
+    parser.add_argument('--supervised_pair_interp_steps', type=int, default=1,
+                        help='If >1, sample one interpolated one-step pseudo-pair from each '
+                             'real (x_t, x_{t+1}) pair, split into this many equal segments')
     parser.add_argument('--physics_loss_weight', type=float, default=1.0,
                         help='Weight for PDE physics loss (default=1.0, set 0 to disable)')
 
@@ -338,6 +354,8 @@ if __name__ == "__main__":
     parser.add_argument('--log_every', type=int, default=100)
     parser.add_argument('--eval_every', type=int, default=500)
     parser.add_argument('--eval_rollout_steps', type=int, default=10)
+    parser.add_argument('--checkpoint_every', type=int, default=5000,
+                        help='Save intermediate checkpoint every N steps (0=disabled, only save best/latest)')
 
     parser.add_argument('--device', type=str, default='cuda:0')
     parser.add_argument('--seed', type=int, default=0)

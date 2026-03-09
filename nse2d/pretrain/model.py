@@ -132,20 +132,25 @@ class SpectralConv2d_MHD(nn.Module):
 # ---------------------------------------------------------------------------
 
 class OutputHead(nn.Module):
-    """Per-field output head with separate train/inference pathways.
+    """Per-field output head.
 
-    Training (output_dim=10):
-      fc_a (4*10-4=36 dims) + fc_b (34 dims) = 70 dims
-      → Conv1d(1,8,12,s=2): 70→30 → Conv1d(8,1,12,s=2): 30→10 = output_dim ✓
+    Multi-step mode (`output_dim > 1`) keeps the original train/inference dual path:
+      - training: `fc_a + fc_b` -> Conv1d stack -> `output_dim`
+      - inference: `fc_b` only -> Conv1d stack -> `1`
 
-    Inference:
-      fc_b (34 dims) only
-      → Conv1d(1,8,12,s=2): 34→12 → Conv1d(8,1,12,s=2): 12→1 ✓
+    One-step mode (`output_dim == 1`) uses a shared `fc_b`-only path for both
+    training and inference. This avoids creating a zero-width `fc_a` layer and
+    keeps the one-step model's train/inference behavior aligned.
     """
 
     def __init__(self, width, output_dim):
         super().__init__()
-        self.fc_a = nn.Linear(width, 4 * output_dim - 4)
+        if output_dim < 1:
+            raise ValueError(f'output_dim must be >= 1, got {output_dim}')
+
+        self.output_dim = output_dim
+        self.shared_one_step_path = (output_dim == 1)
+        self.fc_a = None if self.shared_one_step_path else nn.Linear(width, 4 * output_dim - 4)
         self.fc_b = nn.Linear(width, 34)
         self.mlp = nn.Sequential(
             nn.Conv1d(1, 8, 12, stride=2),
@@ -153,12 +158,19 @@ class OutputHead(nn.Module):
             nn.Conv1d(8, 1, 12, stride=2),
         )
 
+        if self.shared_one_step_path:
+            # Start one-step models close to the identity map. A random full-size
+            # residual at dt=0.1 can explode long autoregressive rollouts before
+            # training even begins.
+            nn.init.zeros_(self.mlp[-1].weight)
+            nn.init.zeros_(self.mlp[-1].bias)
+
     def forward(self, x, inference=False):
         B, Nx, Ny, _ = x.shape
-        if not inference:
-            h = torch.cat([self.fc_a(x), self.fc_b(x)], dim=-1)
-        else:
+        if self.shared_one_step_path or inference:
             h = self.fc_b(x)
+        else:
+            h = torch.cat([self.fc_a(x), self.fc_b(x)], dim=-1)
         h = F.gelu(h)
         h = self.mlp(h.reshape(-1, 1, h.shape[-1]))
         return h.reshape(B, Nx, Ny, -1)

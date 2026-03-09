@@ -12,7 +12,29 @@ sys.path.insert(0, '/zhangtao/project2026/mhd_sim')
 from numerical.equations.five_field_mhd import FiveFieldMHD, FiveFieldMHDConfig
 
 
-def make_mhd5_rhs_fn(mhd, model_dtype=torch.float32):
+def dealias_state(mhd, x):
+    """Dealias each channel in y-direction using mhd._dealias.
+    
+    Removes high-frequency Fourier modes above M to prevent aliasing errors
+    in nonlinear terms (e.g., Poisson bracket [phi, f]).
+    
+    Args:
+        mhd: FiveFieldMHD instance (has _dealias method and cfg.M)
+        x: (B, Nx, Ny, 5) channel-last tensor
+        
+    Returns:
+        Dealiased tensor of same shape
+    """
+    # Process each field independently
+    out_channels = []
+    for c in range(5):
+        field = x[..., c]  # (B, Nx, Ny)
+        field_dealiased = mhd._dealias(field)
+        out_channels.append(field_dealiased)
+    return torch.stack(out_channels, dim=-1)  # (B, Nx, Ny, 5)
+
+
+def make_mhd5_rhs_fn(mhd, model_dtype=torch.float32, dealias=False):
     """Create an RHS adapter: channel-last (B, Nx, Ny, 5) -> (B, Nx, Ny, 5).
 
     The FiveFieldMHD.compute_rhs expects a tuple of 5 tensors each (B, Nx, Ny)
@@ -22,10 +44,14 @@ def make_mhd5_rhs_fn(mhd, model_dtype=torch.float32):
     Args:
         mhd: FiveFieldMHD instance
         model_dtype: dtype of the model output (default float32)
+        dealias: if True, dealias input before computing RHS (prevents aliasing
+                 from high-frequency noise in neural network outputs)
     """
     def rhs_fn(x):
         # x: (B, Nx, Ny, 5), model_dtype
         x_f64 = x.to(torch.float64)
+        if dealias:
+            x_f64 = dealias_state(mhd, x_f64)
         state = tuple(x_f64[..., i] for i in range(5))
         rhs_tuple = mhd.compute_rhs(state)
         return torch.stack(rhs_tuple, dim=-1).to(model_dtype)

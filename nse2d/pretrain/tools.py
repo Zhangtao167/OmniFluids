@@ -62,15 +62,26 @@ def load_mhd5_snapshots(data_path, time_start=250.0, time_end=300.0, dt_data=1.0
         metadata: dict with Nx, Ny, dt_data, n_samples, n_timesteps
     """
     # Use mmap=True to avoid loading entire file into RAM (memory-mapped I/O)
-    # This significantly speeds up loading for large files by only reading accessed data
     print(f'  Loading {data_path} (mmap) ...', end=' ', flush=True)
     data = torch.load(data_path, map_location='cpu', weights_only=False, mmap=True)
     print('done.', flush=True)
 
-    # Calculate time indices FIRST, then slice each field before stacking
-    # This avoids materializing the full tensor in memory
-    t_start_idx = int(round(time_start / dt_data))
-    t_end_idx = int(round(time_end / dt_data))
+    # Determine data's actual time_start for correct index calculation
+    # Priority: 1) metadata['time_start'], 2) t_list[0], 3) default 0.0
+    data_time_start = 0.0  # Safe default (most raw simulation data starts at t=0)
+    if 'metadata' in data and 'time_start' in data['metadata']:
+        data_time_start = data['metadata']['time_start']
+    elif 't_list' in data:
+        data_time_start = float(data['t_list'][0])
+
+    # Calculate time indices relative to data's actual start time
+    t_start_idx = int(round((time_start - data_time_start) / dt_data))
+    t_end_idx = int(round((time_end - data_time_start) / dt_data))
+    
+    # Clamp indices to valid range (prevents out-of-bounds for short datasets)
+    T_total = data[FIELD_NAMES[0]].shape[1]
+    t_start_idx = max(0, min(t_start_idx, T_total - 1))
+    t_end_idx = max(t_start_idx, min(t_end_idx, T_total - 1))
     
     # Slice time window from each field (mmap only reads accessed data)
     fields = [data[name][:, t_start_idx:t_end_idx + 1] for name in FIELD_NAMES]
@@ -123,8 +134,22 @@ def load_mhd5_trajectories(data_path, time_start=250.0, time_end=300.0,
     data = torch.load(data_path, map_location='cpu', weights_only=False, mmap=True)
     print('done.', flush=True)
 
-    t_start_idx = int(round(time_start / dt_data))
-    t_end_idx = int(round(time_end / dt_data))
+    # Determine data's actual time_start for correct index calculation
+    # Priority: 1) metadata['time_start'], 2) t_list[0], 3) default 0.0
+    data_time_start = 0.0  # Safe default (most raw simulation data starts at t=0)
+    if 'metadata' in data and 'time_start' in data['metadata']:
+        data_time_start = data['metadata']['time_start']
+    elif 't_list' in data:
+        data_time_start = float(data['t_list'][0])
+
+    # Calculate time indices relative to data's actual start time
+    t_start_idx = int(round((time_start - data_time_start) / dt_data))
+    t_end_idx = int(round((time_end - data_time_start) / dt_data))
+    
+    # Clamp indices to valid range (prevents out-of-bounds for short datasets)
+    T_total = data[FIELD_NAMES[0]].shape[1]
+    t_start_idx = max(0, min(t_start_idx, T_total - 1))
+    t_end_idx = max(t_start_idx, min(t_end_idx, T_total - 1))
 
     # Slice time before stacking to reduce peak memory
     # With mmap, only the sliced portion will be read from disk
@@ -145,8 +170,11 @@ def load_mhd5_trajectories(data_path, time_start=250.0, time_end=300.0,
     else:
         print(f'  Trajectories: {B} samples, {T} steps, {C} fields, {Nx}x{Ny}')
     
+    actual_time_start = data_time_start + t_start_idx * dt_data
+    actual_time_end = data_time_start + t_end_idx * dt_data
     metadata = dict(Nx=Nx, Ny=Ny, dt_data=dt_data,
-                    n_samples=B, n_timesteps=T, t_start=time_start, t_end=time_end,
+                    n_samples=B, n_timesteps=T, 
+                    t_start=actual_time_start, t_end=actual_time_end,
                     single_trajectory=single_trajectory, traj_idx=traj_idx)
     return states, metadata
 
@@ -496,3 +524,246 @@ class ModelEvolvedGRFGenerator:
     @property
     def Ny(self):
         return self.grf.Ny
+
+
+# ---------------------------------------------------------------------------
+# Metrics and Visualization
+# ---------------------------------------------------------------------------
+
+
+def compute_metrics_and_visualize(
+    gt_traj,
+    pred_traj,
+    metric_step_list=None,
+    plot_step_list=None,
+    visualize=True,
+    save_dir='./eval_results',
+    time_start=250.0,
+    dt_data=1.0,
+    sample_idx=0,
+    field_names=None,
+    eval_key='',
+):
+    """Compute L2 error metrics and visualize GT vs Prediction trajectories.
+
+    Args:
+        gt_traj: Ground truth trajectory, shape (B, T, Nx, Ny, n_fields)
+        pred_traj: Predicted trajectory, shape (B, T, Nx, Ny, n_fields)
+        metric_step_list: List of time steps for metric computation (default: [1, 3, 10])
+        plot_step_list: List of time steps for visualization (default: [0, 1, 3, 5, 10])
+        visualize: Whether to generate plots (default: True)
+        save_dir: Directory to save results
+        time_start: Physical start time in seconds (default: 250.0)
+        dt_data: Time step between trajectory frames in seconds (default: 1.0)
+        sample_idx: Which sample in batch to visualize (default: 0)
+        field_names: List of field names (default: module-level FIELD_NAMES)
+        eval_key: Evaluation key string appended to saved filenames
+
+    Returns:
+        dict: Metrics dictionary with total, per-field, and per-channel-mean
+              L2 errors (averaged over batch)
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    if field_names is None:
+        field_names = FIELD_NAMES
+    if metric_step_list is None:
+        metric_step_list = [1, 3, 10]
+    if plot_step_list is None:
+        plot_step_list = [0, 1, 3, 5, 10]
+
+    if isinstance(gt_traj, torch.Tensor):
+        gt_traj = gt_traj.cpu().numpy()
+    if isinstance(pred_traj, torch.Tensor):
+        pred_traj = pred_traj.cpu().numpy()
+
+    assert gt_traj.shape == pred_traj.shape, \
+        f'Shape mismatch: gt_traj {gt_traj.shape} vs pred_traj {pred_traj.shape}'
+    assert gt_traj.ndim == 5 and gt_traj.shape[-1] == len(field_names), \
+        f'Expected shape (B, T, Nx, Ny, {len(field_names)}), got {gt_traj.shape}'
+
+    B, T, Nx, Ny, n_fields = gt_traj.shape
+    os.makedirs(save_dir, exist_ok=True)
+
+    print(f'  Termwise metrics: (B={B}, T={T}, Nx={Nx}, Ny={Ny}, fields={n_fields})')
+
+    # =========================================================================
+    # 1. Compute Relative L2 Error Metrics (vectorized over batch)
+    # =========================================================================
+    metrics = {
+        'total': {},
+        'per_field': {name: {} for name in field_names},
+        'per_channel_mean': {},
+    }
+
+    for step in metric_step_list:
+        if step >= T:
+            print(f'Warning: step {step} >= T={T}, skipping')
+            continue
+
+        gt_s = gt_traj[:, step]      # (B, Nx, Ny, n_fields)
+        pred_s = pred_traj[:, step]  # (B, Nx, Ny, n_fields)
+
+        # Total relative L2: ||pred-gt||_F / ||gt||_F, per sample then average
+        diff_norms = np.sqrt(np.sum((pred_s - gt_s) ** 2, axis=(1, 2, 3)))  # (B,)
+        gt_norms = np.sqrt(np.sum(gt_s ** 2, axis=(1, 2, 3)))               # (B,)
+        rel_l2 = diff_norms / np.maximum(gt_norms, 1e-10)                   # (B,)
+        metrics['total'][step] = float(np.mean(rel_l2))
+
+        # Per-field relative L2
+        per_ch_vals = []
+        for c, name in enumerate(field_names):
+            diff_c = np.sqrt(np.sum((pred_s[:, :, :, c] - gt_s[:, :, :, c]) ** 2, axis=(1, 2)))
+            gt_c = np.sqrt(np.sum(gt_s[:, :, :, c] ** 2, axis=(1, 2)))
+            rel_c = diff_c / np.maximum(gt_c, 1e-10)
+            val = float(np.mean(rel_c))
+            metrics['per_field'][name][step] = val
+            per_ch_vals.append(val)
+
+        # Per-channel mean: average of per-field rel L2 across channels
+        metrics['per_channel_mean'][step] = float(np.mean(per_ch_vals))
+
+    # Compute mean over first 10 time steps (or available steps)
+    steps_for_mean = [s for s in range(1, 11) if s in metrics['total']]
+    if steps_for_mean:
+        metrics['mean_10step'] = float(np.mean([metrics['total'][s] for s in steps_for_mean]))
+        metrics['mean_rel_l2'] = metrics['mean_10step']  # Alias for compatibility with evaluate()
+        metrics['mean_10step_per_field'] = {
+            name: float(np.mean([metrics['per_field'][name][s] for s in steps_for_mean]))
+            for name in field_names
+        }
+        metrics['mean_10step_per_channel_mean'] = float(np.mean(
+            [metrics['per_channel_mean'][s] for s in steps_for_mean]
+        ))
+
+    # Save metrics to txt file
+    suffix = f'_{eval_key}' if eval_key else ''
+    txt_path = os.path.join(save_dir, f'termwise_metrics{suffix}.txt')
+    with open(txt_path, 'w') as f:
+        f.write('=' * 60 + '\n')
+        f.write(f'Relative L2 Error (averaged over B={B} samples)\n')
+        f.write('=' * 60 + '\n\n')
+
+        if steps_for_mean:
+            steps_str = ','.join(map(str, steps_for_mean))
+            f.write(f'Mean Relative L2 Error (over {len(steps_for_mean)} steps: {steps_str}):\n')
+            f.write('-' * 40 + '\n')
+            f.write(f'  Total:            {metrics["mean_10step"]:.6f}\n')
+            f.write(f'  Per-channel mean: {metrics["mean_10step_per_channel_mean"]:.6f}\n')
+            for name in field_names:
+                f.write(f'  {name:5s}:           {metrics["mean_10step_per_field"][name]:.6f}\n')
+            f.write('\n')
+
+        f.write('Per-step metrics (total | per_ch_mean | per-field):\n')
+        f.write('-' * 40 + '\n')
+        header = ['step', 'total', 'ch_mean'] + field_names
+        f.write('\t'.join(header) + '\n')
+        for step in sorted(metrics['total'].keys()):
+            t_phys = time_start + step * dt_data
+            row = [f'{step}']
+            row.append(f'{metrics["total"].get(step, 0):.6f}')
+            row.append(f'{metrics["per_channel_mean"].get(step, 0):.6f}')
+            for name in field_names:
+                row.append(f'{metrics["per_field"][name].get(step, 0):.6f}')
+            f.write('\t'.join(row) + '\n')
+        if steps_for_mean:
+            f.write(f'mean({len(steps_for_mean)}steps)\t{metrics["mean_10step"]:.6f}')
+            f.write(f'\t{metrics["mean_10step_per_channel_mean"]:.6f}')
+            for name in field_names:
+                f.write(f'\t{metrics["mean_10step_per_field"][name]:.6f}')
+            f.write('\n')
+
+    print(f'  Termwise metrics saved to: {txt_path}')
+
+    # =========================================================================
+    # 2. Visualization (if enabled) - use sample_idx
+    # =========================================================================
+    if not visualize:
+        return metrics
+
+    if sample_idx >= B:
+        print(f'Warning: sample_idx={sample_idx} >= B={B}, using sample_idx=0')
+        sample_idx = 0
+
+    print(f'  Visualizing sample {sample_idx} of {B}')
+
+    gt_vis = gt_traj[sample_idx]      # (T, Nx, Ny, n_fields)
+    pred_vis = pred_traj[sample_idx]  # (T, Nx, Ny, n_fields)
+
+    valid_plot_steps = [s for s in plot_step_list if s < T]
+    n_cols = len(valid_plot_steps)
+
+    if n_cols == 0:
+        print('Warning: No valid plot steps, skipping visualization')
+        return metrics
+
+    for c, field_name in enumerate(field_names):
+        fig, axes = plt.subplots(5, n_cols, figsize=(4 * n_cols, 16))
+        if n_cols == 1:
+            axes = axes.reshape(5, 1)
+
+        for j, step in enumerate(valid_plot_steps):
+            t_phys = time_start + step * dt_data
+
+            gt_snap = gt_vis[step, :, :, c]
+            pred_snap = pred_vis[step, :, :, c]
+            err_snap = pred_snap - gt_snap
+
+            if step > 0:
+                gt_residual = gt_snap - gt_vis[step - 1, :, :, c]
+                pred_residual = pred_snap - pred_vis[step - 1, :, :, c]
+            else:
+                gt_residual = np.zeros_like(gt_snap)
+                pred_residual = np.zeros_like(pred_snap)
+
+            vmin, vmax = gt_snap.min(), gt_snap.max()
+            err_abs = max(abs(err_snap.min()), abs(err_snap.max()), 1e-10)
+            res_abs = max(abs(gt_residual).max(), abs(pred_residual).max(), 1e-10)
+
+            im0 = axes[0, j].imshow(gt_snap.T, aspect='auto', origin='lower',
+                                     cmap='RdBu_r', vmin=vmin, vmax=vmax)
+            axes[0, j].set_title(f'GT  t={t_phys:.0f}s', fontsize=10)
+            fig.colorbar(im0, ax=axes[0, j], fraction=0.046)
+
+            im1 = axes[1, j].imshow(pred_snap.T, aspect='auto', origin='lower',
+                                     cmap='RdBu_r', vmin=vmin, vmax=vmax)
+            axes[1, j].set_title(f'Pred  t={t_phys:.0f}s', fontsize=10)
+            fig.colorbar(im1, ax=axes[1, j], fraction=0.046)
+
+            im2 = axes[2, j].imshow(err_snap.T, aspect='auto', origin='lower',
+                                     cmap='bwr', vmin=-err_abs, vmax=err_abs)
+            axes[2, j].set_title(f'Error  t={t_phys:.0f}s', fontsize=10)
+            fig.colorbar(im2, ax=axes[2, j], fraction=0.046)
+
+            t_prev = t_phys - dt_data if step > 0 else t_phys
+            res_title = f'd/dt  [{t_prev:.0f}->{t_phys:.0f}s]' if step > 0 else f't={t_phys:.0f}s (=0)'
+            im3 = axes[3, j].imshow(gt_residual.T, aspect='auto', origin='lower',
+                                     cmap='PuOr', vmin=-res_abs, vmax=res_abs)
+            axes[3, j].set_title(f'GT Res  {res_title}', fontsize=9)
+            fig.colorbar(im3, ax=axes[3, j], fraction=0.046)
+
+            im4 = axes[4, j].imshow(pred_residual.T, aspect='auto', origin='lower',
+                                     cmap='PuOr', vmin=-res_abs, vmax=res_abs)
+            axes[4, j].set_title(f'Pred Res  {res_title}', fontsize=9)
+            fig.colorbar(im4, ax=axes[4, j], fraction=0.046)
+
+            if j == 0:
+                axes[0, j].set_ylabel('GT\ny (binormal)')
+                axes[1, j].set_ylabel('Prediction\ny (binormal)')
+                axes[2, j].set_ylabel('Error\ny (binormal)')
+                axes[3, j].set_ylabel('GT Residual\ny (binormal)')
+                axes[4, j].set_ylabel('Pred Residual\ny (binormal)')
+
+            axes[4, j].set_xlabel('x (radial)')
+
+        fig.suptitle(f'Field: {field_name} (sample {sample_idx})', fontsize=14, fontweight='bold')
+        plt.tight_layout()
+
+        fig_path = os.path.join(save_dir, f'termwise_field_{field_name}{suffix}.png')
+        plt.savefig(fig_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        print(f'  Saved: {fig_path}')
+
+    return metrics
