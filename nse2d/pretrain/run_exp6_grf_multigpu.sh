@@ -30,8 +30,10 @@ echo ""
 
 # Use accelerate launch for multi-GPU with specified GPUs
 CUDA_VISIBLE_DEVICES=$GPU_IDS /zhangtao/envs/rae/bin/accelerate launch \
+    --multi_gpu \
     --num_processes=$NUM_GPUS \
     --mixed_precision=no \
+    --main_process_port=29506 \
     main.py \
     --mode train \
     --exp_name "$EXP_NAME" \
@@ -57,7 +59,7 @@ CUDA_VISIBLE_DEVICES=$GPU_IDS /zhangtao/envs/rae/bin/accelerate launch \
     --time_integrator crank_nicolson \
     --input_noise_scale 0.0 \
     --lr 0.002 \
-    --batch_size 4 \
+    --batch_size 10 \
     --num_iterations 500 \
     --log_every 50 \
     --eval_every 200 \

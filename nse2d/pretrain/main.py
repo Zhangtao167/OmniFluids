@@ -11,6 +11,7 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 DATA_ROOT = '/zhangtao/project2026/OmniFluids/nse2d/data/qruio_data'
 DEFAULT_DATA = os.path.join(DATA_ROOT, '5field_mhd_batch/data/5field_mhd_dataset.pt')
 DEFAULT_EVAL_DATA = os.path.join(DATA_ROOT, '5field_mhd_batch_test/data/5field_mhd_dataset.pt')
+DEFAULT_GRF_TEST = '/zhangtao/project2026/OmniFluids/nse2d/data/grf_testset/grf_testset_B10_T50_dt1.0_fromdata_radial_dealiased_seed1000.pt'
 
 
 class TeeOutput:
@@ -106,9 +107,7 @@ def run_train(cfg):
         sys.stdout.flush()
     else:
         # Non-main processes only need run_tag and run_dir path, NOT create dirs
-        # Directory creation is handled by main process only to avoid race conditions
         run_tag = make_run_tag(cfg)
-        # Derive run_dir path without creating it (same logic as make_run_dir)
         cfg.run_dir = os.path.join('results', cfg.exp_name, run_tag)
     
     # Sync before model creation
@@ -233,8 +232,8 @@ if __name__ == "__main__":
                         help='Training data path')
     parser.add_argument('--eval_data_path', type=str, default=DEFAULT_EVAL_DATA,
                         help='Evaluation/test data path (separate from training)')
-    parser.add_argument('--eval_grf_data_path', type=str, default='',
-                        help='Optional: GRF test set path for additional evaluation')
+    parser.add_argument('--eval_grf_data_path', type=str, default=DEFAULT_GRF_TEST,
+                        help='GRF test set path for evaluation (default: grf_testset.pt)')
     parser.add_argument('--time_start', type=float, default=250.0)
     parser.add_argument('--time_end', type=float, default=300.0)
     parser.add_argument('--dt_data', type=float, default=1.0)
@@ -319,6 +318,28 @@ if __name__ == "__main__":
                         help='1=use fixed GRF random data for overfitting test')
     parser.add_argument('--grf_overfitting_seed', type=int, default=42,
                         help='Seed for generating fixed GRF data (default=42)')
+
+    # Learnable GRF: make alpha/tau trainable via PDE loss gradient
+    parser.add_argument('--learnable_grf', type=int, default=0,
+                        help='1=enable learnable GRF (alpha/tau are trainable parameters)')
+    parser.add_argument('--learnable_grf_start_step', type=int, default=20000,
+                        help='Step to start learning GRF parameters (default=20000)')
+    parser.add_argument('--learnable_grf_lr_ratio', type=float, default=0.01,
+                        help='GRF optimizer lr = model_lr * this ratio (default=0.01)')
+    parser.add_argument('--learnable_grf_alpha_min', type=float, default=1.0,
+                        help='Minimum clamp value for alpha (default=1.0)')
+    parser.add_argument('--learnable_grf_alpha_max', type=float, default=6.0,
+                        help='Maximum clamp value for alpha (default=6.0)')
+    parser.add_argument('--learnable_grf_tau_min', type=float, default=0.5,
+                        help='Minimum clamp value for tau (default=0.5)')
+    parser.add_argument('--learnable_grf_tau_max', type=float, default=20.0,
+                        help='Maximum clamp value for tau (default=20.0)')
+    parser.add_argument('--learnable_grf_reg_weight', type=float, default=0.0,
+                        help='L2 regularization weight to prevent drift from initial values (default=0)')
+    parser.add_argument('--learnable_grf_accum_steps', type=int, default=1,
+                        help='Gradient accumulation steps for GRF optimizer (default=1)')
+    parser.add_argument('--learnable_grf_log_every', type=int, default=1000,
+                        help='Log GRF parameters every N steps (default=1000)')
 
     # Self-training mode: use training model itself to generate data
     parser.add_argument('--self_training_start_step', type=int, default=0,

@@ -35,6 +35,7 @@ def generate_grf_testset(
     Nx=512, Ny=256, device='cuda:0',
     output_dir='./data/grf_testset', base_seed=1000,
     use_radial_mask=True,
+    dealias_init=True,
     data_path=None,
     time_start_for_stats=250.0,
     time_end_for_stats=300.0,
@@ -50,6 +51,7 @@ def generate_grf_testset(
         output_dir: Output directory
         base_seed: Base random seed
         use_radial_mask: Whether to apply radial mask to GRF
+        dealias_init: Whether to dealias initial conditions (MUST be True to match training!)
         data_path: Path to training data for deriving field_scales (REQUIRED for consistency)
         time_start_for_stats: Start time for computing field_scales from data
         time_end_for_stats: End time for computing field_scales from data
@@ -69,6 +71,7 @@ def generate_grf_testset(
     print(f"  Grid: {Nx} x {Ny}")
     print(f"  Device: {device}")
     print(f"  use_radial_mask: {use_radial_mask}")
+    print(f"  dealias_init: {dealias_init} (MUST be True to match training!)")
     print("=" * 60)
 
     output_path = Path(output_dir)
@@ -116,55 +119,81 @@ def generate_grf_testset(
     data = {name: torch.zeros(n_samples, T, Nx, Ny, dtype=torch.float32) for name in field_names}
     
     # Track valid frames per trajectory (for NaN detection)
-    valid_frames = torch.zeros(n_samples, dtype=torch.int32)
-
-    # Generate trajectories
-    print(f"\nGenerating {n_samples} trajectories...")
+    valid_frames = torch.ones(n_samples, dtype=torch.int32) * T  # Assume all complete initially
     
-    for b in tqdm(range(n_samples), desc="Trajectories"):
-        seed = base_seed + b
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed(seed)
-        np.random.seed(seed)
+    # Track which trajectories are still active (no NaN yet)
+    active_mask = torch.ones(n_samples, dtype=torch.bool, device=device)
 
-        # Generate GRF initial condition (B, Nx, Ny, 5)
-        x_0 = grf(batch_size=1)
-        
-        # Convert to state tuple: 5 tensors each (1, Nx, Ny)
-        state = tuple(x_0[0, :, :, i].unsqueeze(0).to(torch.float64) for i in range(5))
-
-        # Save t=0
-        for i, name in enumerate(field_names):
-            data[name][b, 0] = state[i][0].float().cpu()
-        
-        last_valid_frame = 0
-
-        # Evolve with inner progress bar
-        with torch.no_grad():
-            pbar_inner = tqdm(range(1, T), desc=f"  Traj {b} frames", leave=False)
-            for t_idx in pbar_inner:
-                nan_detected = False
-                for step in range(steps_per_frame):
-                    if torch.isnan(state[0]).any():
-                        print(f"\n[WARN] NaN at traj {b}, frame {t_idx}, substep {step}")
-                        nan_detected = True
-                        break
-                    state = rk4_step(mhd.compute_rhs, state, dt_sim)
-                    state = mhd.apply_boundary_conditions(state)
+    # Generate all GRF initial conditions at once (PARALLEL)
+    print(f"\nGenerating {n_samples} GRF initial conditions (parallel)...")
+    torch.manual_seed(base_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(base_seed)
+    np.random.seed(base_seed)
+    
+    # Generate all initial conditions: (n_samples, Nx, Ny, 5)
+    x_0_all = grf(batch_size=n_samples)
+    
+    # Convert to state tuple: 5 tensors each (n_samples, Nx, Ny) in float64
+    state = tuple(x_0_all[..., i].to(torch.float64) for i in range(5))
+    
+    # Dealias initial conditions to match training (remove modes above M)
+    # This ensures GRF test set frequency spectrum matches training data
+    # (training uses dealias_input=True by default)
+    if dealias_init:
+        print(f"  Applying dealias to initial conditions (M={mhd.cfg.M})...")
+        state = tuple(mhd._dealias(s) for s in state)
+        dealias_tag = 'dealiased'
+    else:
+        print(f"  [WARNING] NOT applying dealias - test set will NOT match training!")
+        dealias_tag = 'raw'
+    
+    # Save t=0 for all trajectories
+    for i, name in enumerate(field_names):
+        data[name][:, 0] = state[i].float().cpu()
+    
+    print(f"  Initial conditions generated: {x_0_all.shape} ({dealias_tag})")
+    del x_0_all
+    
+    # Evolve all trajectories in PARALLEL
+    print(f"\nEvolving {n_samples} trajectories in parallel...")
+    print(f"  Steps per frame: {steps_per_frame}, Total frames: {T-1}")
+    
+    with torch.no_grad():
+        for t_idx in tqdm(range(1, T), desc="Frames"):
+            # Evolve one data frame (steps_per_frame RK4 steps)
+            for step in range(steps_per_frame):
+                # Check for NaN in active trajectories
+                nan_per_traj = torch.stack([torch.isnan(s).any(dim=(1, 2)) for s in state]).any(dim=0)
+                newly_failed = nan_per_traj & active_mask
                 
-                if nan_detected:
+                if newly_failed.any():
+                    failed_indices = torch.where(newly_failed)[0].tolist()
+                    print(f"\n[WARN] NaN detected at frame {t_idx}, step {step}: trajectories {failed_indices}")
+                    # Mark as inactive and record valid frames
+                    for idx in failed_indices:
+                        valid_frames[idx] = t_idx
+                    active_mask = active_mask & ~nan_per_traj
+                
+                # If all trajectories failed, stop early
+                if not active_mask.any():
+                    print(f"\n[ERROR] All trajectories have NaN, stopping at frame {t_idx}")
                     break
                 
-                for i, name in enumerate(field_names):
-                    data[name][b, t_idx] = state[i][0].float().cpu()
-                last_valid_frame = t_idx
-            pbar_inner.close()
-        
-        valid_frames[b] = last_valid_frame + 1  # +1 because frame 0 is always valid
-
-        if (b + 1) % 5 == 0:
-            torch.cuda.empty_cache()
+                # RK4 step for all trajectories
+                state = rk4_step(mhd.compute_rhs, state, dt_sim)
+                state = mhd.apply_boundary_conditions(state)
+            
+            if not active_mask.any():
+                break
+            
+            # Save frame for all trajectories (even failed ones keep their last valid state)
+            for i, name in enumerate(field_names):
+                data[name][:, t_idx] = state[i].float().cpu()
+            
+            # Periodic memory cleanup
+            if t_idx % 10 == 0:
+                torch.cuda.empty_cache()
 
     # Generate t_list (physical time array, compatible with mhd_sim format)
     # Use time_start=250.0 to match mhd_sim convention (allows using default eval params)
@@ -174,7 +203,8 @@ def generate_grf_testset(
     # Build descriptive filename with GRF config info
     mask_tag = 'radial' if use_radial_mask else 'full'
     scales_tag = 'fromdata' if grf_scales_source == 'from_data' else 'default'
-    filename = f'grf_testset_B{n_samples}_T{n_steps}_dt{dt_data}_{scales_tag}_{mask_tag}_seed{base_seed}.pt'
+    # dealias_tag is defined earlier based on dealias_init flag
+    filename = f'grf_testset_B{n_samples}_T{n_steps}_dt{dt_data}_{scales_tag}_{mask_tag}_{dealias_tag}_seed{base_seed}.pt'
     output_file = output_path / filename
     
     # Also create a symlink 'grf_testset.pt' for backward compatibility
@@ -193,6 +223,8 @@ def generate_grf_testset(
         'time_start': virtual_time_start,
         'time_end': virtual_time_start + n_steps * dt_data,
         'use_radial_mask': use_radial_mask,
+        'dealias_init': dealias_init,
+        'dealias_M': mhd.cfg.M if dealias_init else None,
         'field_names': field_names,
         'is_grf_data': True,
         'grf_scales_source': grf_scales_source,
@@ -260,6 +292,9 @@ Examples:
     parser.add_argument('--base-seed', type=int, default=1000)
     parser.add_argument('--no-radial-mask', action='store_true',
                         help='Disable radial mask (not recommended)')
+    parser.add_argument('--no-dealias-init', action='store_true',
+                        help='Disable dealiasing of initial conditions (NOT recommended! '
+                             'Use only if training also uses dealias_input=False)')
     parser.add_argument('--data-path', type=str, default=DEFAULT_DATA_PATH,
                         help='Path to training data for deriving GRF field_scales '
                              '(REQUIRED for consistency with training)')
@@ -277,6 +312,7 @@ Examples:
         output_dir=args.output_dir,
         base_seed=args.base_seed,
         use_radial_mask=not args.no_radial_mask,
+        dealias_init=not args.no_dealias_init,
         data_path=args.data_path,
         time_start_for_stats=args.time_start_for_stats,
         time_end_for_stats=args.time_end_for_stats,

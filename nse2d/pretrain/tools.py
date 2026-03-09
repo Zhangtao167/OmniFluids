@@ -352,6 +352,242 @@ class MHD5FieldGRF:
 
 
 # ---------------------------------------------------------------------------
+# Learnable GRF: alpha and tau are trainable parameters
+# ---------------------------------------------------------------------------
+
+class LearnableMHD5FieldGRF(torch.nn.Module):
+    """GRF generator with learnable alpha and tau parameters.
+    
+    This class wraps the GRF generation process and makes the spectral parameters
+    (alpha and tau) trainable via gradient descent. The gradient flows through
+    the sqrt_eig computation using the reparameterization trick.
+    
+    Key design:
+    - alpha/tau stored as nn.Parameter (per-field: 5 alphas + 5 taus = 10 params)
+    - sqrt_eig computed dynamically in forward() to maintain gradient flow
+    - Parameters clamped to valid ranges after each update
+    - Supports regularization to prevent drift from initial values
+    """
+    
+    DEFAULT_ALPHAS = [2.5, 2.0, 2.5, 3.0, 2.5]
+    DEFAULT_TAUS = [7.0, 5.0, 7.0, 10.0, 7.0]
+    
+    def __init__(self, Nx=512, Ny=256, alpha=None, tau=None,
+                 field_scales=None, device='cpu',
+                 x_active_range=(180, 330), x_edge_width=20.0,
+                 use_radial_mask=True,
+                 alpha_min=1.0, alpha_max=6.0,
+                 tau_min=0.5, tau_max=20.0):
+        """
+        Args:
+            alpha_min/max: clamp range for alpha parameters
+            tau_min/max: clamp range for tau parameters
+            Other args: same as MHD5FieldGRF
+        """
+        super().__init__()
+        
+        self.Nx = Nx
+        self.Ny = Ny
+        self.n_fields = 5
+        self.use_radial_mask = use_radial_mask
+        
+        # Clamp ranges
+        self.alpha_min = alpha_min
+        self.alpha_max = alpha_max
+        self.tau_min = tau_min
+        self.tau_max = tau_max
+        
+        # Parse initial alpha/tau values
+        if alpha is None:
+            init_alphas = self.DEFAULT_ALPHAS
+        elif isinstance(alpha, (int, float)):
+            init_alphas = [float(alpha)] * 5
+        else:
+            init_alphas = list(alpha)
+            
+        if tau is None:
+            init_taus = self.DEFAULT_TAUS
+        elif isinstance(tau, (int, float)):
+            init_taus = [float(tau)] * 5
+        else:
+            init_taus = list(tau)
+        
+        # Store initial values for regularization
+        self.register_buffer('init_alphas', torch.tensor(init_alphas, dtype=torch.float32))
+        self.register_buffer('init_taus', torch.tensor(init_taus, dtype=torch.float32))
+        
+        # Learnable parameters
+        self.alphas = torch.nn.Parameter(torch.tensor(init_alphas, dtype=torch.float32))
+        self.taus = torch.nn.Parameter(torch.tensor(init_taus, dtype=torch.float32))
+        
+        # Field scales (not learnable)
+        if field_scales is None:
+            field_scales = torch.tensor([1.0, 0.8, 1.5, 20.0, 1.5])
+        self.register_buffer('field_scales', field_scales.clone().detach())
+        
+        # Precompute wavenumber grids (not dependent on alpha/tau)
+        Lx = 2 * math.pi
+        Ly = 2 * math.pi
+        cx = (4 * math.pi ** 2) / (Lx ** 2)
+        cy = (4 * math.pi ** 2) / (Ly ** 2)
+        
+        kx = torch.arange(0, Nx, dtype=torch.float32)
+        ky = torch.arange(0, Ny // 2 + 1, dtype=torch.float32)
+        kx2 = (cx * kx ** 2).unsqueeze(1)  # (Nx, 1)
+        ky2 = (cy * ky ** 2).unsqueeze(0)  # (1, Ny//2+1)
+        
+        self.register_buffer('kx2', kx2)
+        self.register_buffer('ky2', ky2)
+        self.register_buffer('scale_factor', torch.tensor(float(Nx * Ny)))
+        
+        # Radial window (not learnable)
+        idx = torch.arange(Nx, dtype=torch.float32)
+        dirichlet = torch.sin(math.pi * idx / (Nx - 1))
+        
+        if x_active_range is not None:
+            lo, hi = x_active_range
+            ew = max(x_edge_width, 1.0)
+            radial_mask = 0.5 * (torch.tanh((idx - lo) / ew) - torch.tanh((idx - hi) / ew))
+            radial_window = dirichlet * radial_mask
+        else:
+            radial_window = dirichlet
+        
+        self.register_buffer('radial_window', radial_window)
+        self.x_active_range = x_active_range
+        self.x_edge_width = x_edge_width
+        
+        # Training state
+        self._learning_enabled = False
+        self._accum_step = 0
+        self.disable_learning()
+        
+        print(f'[LearnableGRF] init alphas={init_alphas}, taus={init_taus}')
+        print(f'[LearnableGRF] clamp: alpha=[{alpha_min}, {alpha_max}], tau=[{tau_min}, {tau_max}]')
+    
+    def _compute_sqrt_eig(self, alpha, tau):
+        """Compute sqrt_eig for a single (alpha, tau) pair.
+        
+        This is computed dynamically to maintain gradient flow.
+        """
+        sigma = 0.5 * tau ** (0.5 * (2 * alpha - 2.0))
+        sqrt_eig = sigma * (self.kx2 + self.ky2 + tau ** 2) ** (-alpha / 2.0)
+        sqrt_eig = sqrt_eig.clone()
+        sqrt_eig[0, 0] = 0.0
+        return sqrt_eig * self.scale_factor
+    
+    def forward(self, batch_size):
+        """Generate random 5-field initial conditions with learnable spectral params.
+        
+        Returns:
+            (batch_size, Nx, Ny, 5) float32 tensor, channel-last
+        """
+        B, Nx, Ny = batch_size, self.Nx, self.Ny
+        device = self.alphas.device
+        
+        # Get clamped parameters
+        alphas = torch.clamp(self.alphas, self.alpha_min, self.alpha_max)
+        taus = torch.clamp(self.taus, self.tau_min, self.tau_max)
+        
+        fields = []
+        for c in range(self.n_fields):
+            sqrt_eig = self._compute_sqrt_eig(alphas[c], taus[c])
+            
+            # Generate random noise (fixed during forward, gradient flows through sqrt_eig)
+            xi = torch.randn(B, Nx, Ny // 2 + 1, 2, dtype=torch.float32, device=device)
+            
+            # Scale by sqrt_eig (this is where gradient flows)
+            xi_scaled = torch.complex(xi[..., 0] * sqrt_eig, xi[..., 1] * sqrt_eig)
+            
+            # Inverse FFT to get spatial field
+            u = torch.fft.irfft2(xi_scaled, s=(Nx, Ny))
+            
+            # Apply radial mask if enabled
+            if self.use_radial_mask:
+                u = u * self.radial_window.reshape(1, Nx, 1)
+            
+            # Scale by field amplitude
+            u = u * self.field_scales[c]
+            fields.append(u)
+        
+        out = torch.stack(fields, dim=-1)  # (B, Nx, Ny, 5)
+        return out
+    
+    def compute_reg_loss(self):
+        """Compute regularization loss to prevent drift from initial values.
+        
+        Returns:
+            L2 regularization loss: ||alpha - alpha_init||^2 + ||tau - tau_init||^2
+        """
+        alpha_diff = self.alphas - self.init_alphas
+        tau_diff = self.taus - self.init_taus
+        return (alpha_diff ** 2).sum() + (tau_diff ** 2).sum()
+    
+    def clamp_parameters(self):
+        """Clamp parameters to valid ranges (call after optimizer.step())."""
+        with torch.no_grad():
+            self.alphas.data.clamp_(self.alpha_min, self.alpha_max)
+            self.taus.data.clamp_(self.tau_min, self.tau_max)
+    
+    def enable_learning(self):
+        """Enable gradient computation for GRF parameters."""
+        self._learning_enabled = True
+        self.alphas.requires_grad_(True)
+        self.taus.requires_grad_(True)
+        print(f'[LearnableGRF] Learning ENABLED')
+        print(f'  Current alphas: {self.alphas.data.tolist()}')
+        print(f'  Current taus: {self.taus.data.tolist()}')
+    
+    def disable_learning(self):
+        """Disable gradient computation for GRF parameters."""
+        self._learning_enabled = False
+        self.alphas.requires_grad_(False)
+        self.taus.requires_grad_(False)
+    
+    def is_learning_enabled(self):
+        """Check if learning is enabled."""
+        return self._learning_enabled
+    
+    def get_param_dict(self):
+        """Get current parameter values as dict (for logging)."""
+        return {
+            'alphas': self.alphas.data.tolist(),
+            'taus': self.taus.data.tolist(),
+            'alpha_grads': self.alphas.grad.tolist() if self.alphas.grad is not None else None,
+            'tau_grads': self.taus.grad.tolist() if self.taus.grad is not None else None,
+        }
+    
+    @staticmethod
+    def from_data_stats(data_path, Nx=512, Ny=256, alpha=None, tau=None,
+                        device='cpu', time_start=250.0, time_end=300.0,
+                        dt_data=1.0, x_active_range=(180, 330),
+                        x_edge_width=20.0, use_radial_mask=True,
+                        alpha_min=1.0, alpha_max=6.0,
+                        tau_min=0.5, tau_max=20.0):
+        """Create LearnableGRF with field_scales derived from training data std."""
+        print(f'  [LearnableGRF] Computing stats from {data_path} ...', end=' ', flush=True)
+        data = torch.load(data_path, map_location='cpu', weights_only=False, mmap=True)
+        scales = []
+        for name in FIELD_NAMES:
+            t0 = int(round(time_start / dt_data))
+            t1 = int(round(time_end / dt_data))
+            field = data[name][:, t0:t1 + 1]
+            scales.append(field.std().item())
+        del data
+        print('done.', flush=True)
+        field_scales = torch.tensor(scales, dtype=torch.float32)
+        print(f'  [LearnableGRF] field_scales from data: {dict(zip(FIELD_NAMES, scales))}')
+        
+        grf = LearnableMHD5FieldGRF(
+            Nx, Ny, alpha, tau, field_scales, device,
+            x_active_range=x_active_range,
+            x_edge_width=x_edge_width,
+            use_radial_mask=use_radial_mask,
+            alpha_min=alpha_min, alpha_max=alpha_max,
+            tau_min=tau_min, tau_max=tau_max)
+        return grf.to(device)
+
+
+# ---------------------------------------------------------------------------
 # Fixed GRF data for overfitting test
 # ---------------------------------------------------------------------------
 

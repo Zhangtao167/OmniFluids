@@ -15,7 +15,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
 from tools import (load_mhd5_snapshots, load_mhd5_trajectories, MHD5FieldGRF, 
-                   FixedGRFDataSampler, ModelEvolvedGRFGenerator,
+                   LearnableMHD5FieldGRF, FixedGRFDataSampler, ModelEvolvedGRFGenerator,
                    compute_metrics_and_visualize)
 from psm_loss import build_mhd_instance, make_mhd5_rhs_fn, compute_physics_loss, dealias_state
 
@@ -601,26 +601,61 @@ def _make_grf_generator(config, device=None):
     Args:
         config: Configuration object
         device: Override device (for multi-GPU, use accelerator.device)
+    
+    Returns:
+        GRF generator (MHD5FieldGRF or LearnableMHD5FieldGRF)
     """
     # None -> use per-field defaults inside MHD5FieldGRF
     alpha = getattr(config, 'grf_alpha', None)
     tau = getattr(config, 'grf_tau', None)
     use_radial_mask = bool(getattr(config, 'grf_use_radial_mask', 1))
     target_device = device if device is not None else config.device
-    if getattr(config, 'grf_scale_from_data', 1):
-        grf = MHD5FieldGRF.from_data_stats(
-            config.data_path, Nx=config.Nx, Ny=config.Ny,
-            alpha=alpha, tau=tau,
-            device=target_device,
-            time_start=config.time_start, time_end=config.time_end,
-            dt_data=config.dt_data,
-            use_radial_mask=use_radial_mask)
+    
+    # Check if learnable GRF is enabled
+    use_learnable = bool(getattr(config, 'learnable_grf', 0))
+    
+    if use_learnable:
+        # Learnable GRF with trainable alpha/tau
+        alpha_min = getattr(config, 'learnable_grf_alpha_min', 1.0)
+        alpha_max = getattr(config, 'learnable_grf_alpha_max', 6.0)
+        tau_min = getattr(config, 'learnable_grf_tau_min', 0.5)
+        tau_max = getattr(config, 'learnable_grf_tau_max', 20.0)
+        
+        print(f'[LearnableGRF] Creating learnable GRF generator')
+        if getattr(config, 'grf_scale_from_data', 1):
+            grf = LearnableMHD5FieldGRF.from_data_stats(
+                config.data_path, Nx=config.Nx, Ny=config.Ny,
+                alpha=alpha, tau=tau,
+                device=target_device,
+                time_start=config.time_start, time_end=config.time_end,
+                dt_data=config.dt_data,
+                use_radial_mask=use_radial_mask,
+                alpha_min=alpha_min, alpha_max=alpha_max,
+                tau_min=tau_min, tau_max=tau_max)
+        else:
+            grf = LearnableMHD5FieldGRF(
+                Nx=config.Nx, Ny=config.Ny,
+                alpha=alpha, tau=tau,
+                device=target_device,
+                use_radial_mask=use_radial_mask,
+                alpha_min=alpha_min, alpha_max=alpha_max,
+                tau_min=tau_min, tau_max=tau_max)
     else:
-        grf = MHD5FieldGRF(
-            Nx=config.Nx, Ny=config.Ny,
-            alpha=alpha, tau=tau,
-            device=target_device,
-            use_radial_mask=use_radial_mask)
+        # Standard non-learnable GRF
+        if getattr(config, 'grf_scale_from_data', 1):
+            grf = MHD5FieldGRF.from_data_stats(
+                config.data_path, Nx=config.Nx, Ny=config.Ny,
+                alpha=alpha, tau=tau,
+                device=target_device,
+                time_start=config.time_start, time_end=config.time_end,
+                dt_data=config.dt_data,
+                use_radial_mask=use_radial_mask)
+        else:
+            grf = MHD5FieldGRF(
+                Nx=config.Nx, Ny=config.Ny,
+                alpha=alpha, tau=tau,
+                device=target_device,
+                use_radial_mask=use_radial_mask)
     return grf
 
 
@@ -1239,7 +1274,7 @@ def train(config, net, accelerator=None):
         if is_main_process:
             print(f'Pre-loading GRF test set: {eval_grf_data_path}')
         # GRF test set uses the same format as mhd_sim data
-        grf_file = os.path.join(eval_grf_data_path, 'grf_testset.pt') if os.path.isdir(eval_grf_data_path) else eval_grf_data_path
+        grf_file = os.path.join(eval_grf_data_path, 'grf_testset_B10_T50_dt1.0_fromdata_radial_dealiased_seed1000.pt') if os.path.isdir(eval_grf_data_path) else eval_grf_data_path
         if os.path.exists(grf_file):
             eval_grf_data, grf_meta = load_mhd5_trajectories(
                 grf_file, time_start=config.time_start, time_end=config.time_end,
@@ -1381,6 +1416,41 @@ def train(config, net, accelerator=None):
     if accelerator is not None:
         net, optimizer, scheduler = accelerator.prepare(net, optimizer, scheduler)
 
+    # --- Learnable GRF setup ---
+    grf_optimizer = None
+    grf_scheduler = None
+    use_learnable_grf = bool(getattr(config, 'learnable_grf', 0))
+    learnable_grf_start = getattr(config, 'learnable_grf_start_step', 20000)
+    learnable_grf_accum = getattr(config, 'learnable_grf_accum_steps', 1)
+    learnable_grf_reg = getattr(config, 'learnable_grf_reg_weight', 0.0)
+    learnable_grf_log_every = getattr(config, 'learnable_grf_log_every', 1000)
+    
+    if use_learnable_grf and need_online and isinstance(grf, LearnableMHD5FieldGRF):
+        # Check for conflict with self-training
+        if getattr(config, 'self_training_start_step', 0) > 0:
+            raise ValueError('Cannot use learnable_grf with self_training simultaneously')
+        if getattr(config, 'pretrained_model_path', None) is not None:
+            raise ValueError('Cannot use learnable_grf with pretrained model-evolved GRF')
+        
+        # Prepare learnable GRF with accelerator for multi-GPU sync
+        if accelerator is not None:
+            grf = accelerator.prepare(grf)
+        
+        # Create separate optimizer for GRF parameters
+        grf_lr_ratio = getattr(config, 'learnable_grf_lr_ratio', 0.01)
+        grf_lr = config.lr * grf_lr_ratio
+        
+        # Get the actual module (unwrap if needed)
+        grf_module = accelerator.unwrap_model(grf) if accelerator is not None else grf
+        grf_optimizer = optim.Adam(grf_module.parameters(), lr=grf_lr)
+        
+        if is_main_process:
+            print(f'[LearnableGRF] Optimizer created:')
+            print(f'  lr = {grf_lr:.2e} (model_lr × {grf_lr_ratio})')
+            print(f'  start_step = {learnable_grf_start}')
+            print(f'  accum_steps = {learnable_grf_accum}')
+            print(f'  reg_weight = {learnable_grf_reg}')
+    
     # Create self-training generator AFTER model is on device and wrapped
     # This ensures we copy the correct initial weights
     need_self_training_gen = getattr(config, '_need_self_training_generator', False)
@@ -1534,11 +1604,65 @@ def train(config, net, accelerator=None):
         euler_weight = _get_euler_weight(global_step, config)
 
         if source == 'online':
+            # === Learnable GRF: check activation and learning ===
+            grf_module = None
+            if use_learnable_grf and grf_optimizer is not None:
+                grf_module = accelerator.unwrap_model(grf) if accelerator is not None else grf
+                
+                # Activate learning at start_step
+                if global_step == learnable_grf_start and not grf_module.is_learning_enabled():
+                    grf_module.enable_learning()
+                    if is_main_process:
+                        print(f'\n[LearnableGRF] Learning ACTIVATED at step {global_step}')
+                        params = grf_module.get_param_dict()
+                        print(f'  Initial alphas: {params["alphas"]}')
+                        print(f'  Initial taus: {params["taus"]}\n')
+                        sys.stdout.flush()
+            
             x_0 = grf(config.batch_size)
             net.train()
             loss_val, loss_components = _train_step(
                 net, x_0, rhs_fn, optimizer, scheduler, config,
                 accelerator=accelerator, euler_weight=euler_weight, mhd=mhd)
+            
+            # === Learnable GRF: gradient accumulation and update ===
+            if (use_learnable_grf and grf_optimizer is not None 
+                and grf_module is not None and grf_module.is_learning_enabled()):
+                
+                # Compute GRF regularization loss
+                grf_reg_loss = torch.tensor(0.0, device=device)
+                if learnable_grf_reg > 0:
+                    grf_reg_loss = learnable_grf_reg * grf_module.compute_reg_loss()
+                    loss_components['grf_reg'] = grf_reg_loss.item()
+                
+                # The main physics loss gradient already flows to GRF parameters
+                # through the x_0 -> pred_traj -> physics_loss chain.
+                # We just need to add regularization and step the optimizer.
+                
+                # Accumulate gradients
+                grf_module._accum_step += 1
+                
+                if grf_module._accum_step >= learnable_grf_accum:
+                    # Add regularization loss (backward separately to avoid affecting model grads)
+                    if learnable_grf_reg > 0:
+                        grf_reg_loss.backward()
+                    
+                    # Step GRF optimizer
+                    grf_optimizer.step()
+                    grf_module.clamp_parameters()
+                    grf_optimizer.zero_grad()
+                    grf_module._accum_step = 0
+                
+                # Periodic logging of GRF parameters
+                if is_main_process and global_step % learnable_grf_log_every == 0:
+                    params = grf_module.get_param_dict()
+                    print(f'  [LearnableGRF] step {global_step}:')
+                    print(f'    alphas: {[f"{a:.4f}" for a in params["alphas"]]}')
+                    print(f'    taus: {[f"{t:.4f}" for t in params["taus"]]}')
+                    if params["alpha_grads"] is not None:
+                        print(f'    alpha_grads: {[f"{g:.2e}" for g in params["alpha_grads"]]}')
+                        print(f'    tau_grads: {[f"{g:.2e}" for g in params["tau_grads"]]}')
+                    sys.stdout.flush()
         else:
             # Offline mode: can use supervised loss if enabled
             if use_supervised and supervised_sampler is not None:

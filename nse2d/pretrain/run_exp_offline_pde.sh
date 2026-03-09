@@ -1,36 +1,51 @@
 #!/bin/bash
 # =============================================================================
-# 实验1b: 纯监督Loss训练 (无PDE loss) - 多卡版本
-# rollout_dt=1.0s (model_dt=1.0s), output_dim=10
-# 使用Offline仿真数据，只用MSE监督loss
-# 训练/评估时间尺度匹配：rollout_dt=dt_data=1.0s → n_substeps=1
+# 实验: 纯 Offline + PDE Loss 训练
+# 
+# 特点:
+#   - 完全使用 offline 仿真数据 (5field_mhd_batch)
+#   - 纯 PDE loss (physics_loss_weight=1.0, supervised_loss_weight=0.0)
+#   - 同时在 MHD 和 GRF 测试集上评估
+#   - 每 5000 step 评估和保存 checkpoint
 # =============================================================================
 
 set -e
 
-source /opt/conda/bin/activate
-conda activate /zhangtao/envs/rae || true
-cd /zhangtao/project2026/OmniFluids/nse2d/pretrain
+# Activate environment
+# source /opt/conda/bin/activate
+# conda activate /zhangtao/envs/rae || true
+# cd /zhangtao/project2026/OmniFluids/nse2d/pretrain
 
+# Data paths
 DATA_PATH="/zhangtao/project2026/OmniFluids/nse2d/data/qruio_data/5field_mhd_batch/data/5field_mhd_dataset.pt"
 EVAL_DATA_PATH="/zhangtao/project2026/OmniFluids/nse2d/data/qruio_data/5field_mhd_batch_test/data/5field_mhd_dataset.pt"
 EVAL_GRF_PATH="/zhangtao/project2026/OmniFluids/nse2d/data/grf_testset/grf_testset_B10_T50_dt1.0_fromdata_radial_dealiased_seed1000.pt"
 
-EXP_NAME="exp1b_pure_supervised_dt1s_multigpu"
+# Experiment name
+EXP_NAME="exp_offline_pde_only"
+
+# GPU configuration (可以通过参数覆盖)
 GPUS=${1:-"0,1,2,3"}
+IFS=',' read -ra GPU_ARR <<< "$GPUS"
+NUM_PROCESSES=${#GPU_ARR[@]}
 
 echo "========================================================================="
-echo "  实验1b: 纯监督Loss (rollout_dt=1.0s, output_dim=10) - 多卡"
+echo "  实验: 纯 Offline + PDE Loss 训练"
 echo "========================================================================="
-echo "  GPUs: $GPUS"
-echo "  rollout_dt=1.0s, dt_data=1.0s → n_substeps=1 (训练/评估时间尺度匹配)"
-echo "  Physics Loss: DISABLED  |  Supervised Loss: MSE (weight=1.0)"
+echo "  GPUs: $GPUS (num_processes: $NUM_PROCESSES)"
+echo "  Training data: $DATA_PATH"
+echo "  MHD test data: $EVAL_DATA_PATH"
+echo "  GRF test data: $EVAL_GRF_PATH"
+echo ""
+echo "  Loss: PDE loss only (physics_loss_weight=1.0)"
+echo "  Eval: every 5000 steps on both MHD and GRF test sets"
+echo "  Checkpoint: every 5000 steps"
 echo "========================================================================="
 echo ""
 
 export CUDA_VISIBLE_DEVICES=$GPUS
 
-accelerate launch --multi_gpu --num_processes=4 --main_process_port=29503 main.py \
+accelerate launch --multi_gpu --num_processes "$NUM_PROCESSES" --main_process_port=29500 main.py \
     --mode train \
     --use_accelerate 1 \
     --exp_name "$EXP_NAME" \
@@ -38,13 +53,9 @@ accelerate launch --multi_gpu --num_processes=4 --main_process_port=29503 main.p
     --eval_data_path "$EVAL_DATA_PATH" \
     --eval_grf_data_path "$EVAL_GRF_PATH" \
     --data_mode "offline" \
-    --physics_loss_weight 0.0 \
-    --supervised_loss_weight 1.0 \
-    --supervised_mse_weight 1.0 \
-    --supervised_mae_weight 0.0 \
-    --supervised_n_substeps 1 \
+    --physics_loss_weight 1.0 \
+    --supervised_loss_weight 0.0 \
     --mae_weight 0.0 \
-    --grf_use_radial_mask 0 \
     --time_start 250.0 \
     --time_end 300.0 \
     --Nx 512 --Ny 256 \
@@ -53,13 +64,21 @@ accelerate launch --multi_gpu --num_processes=4 --main_process_port=29503 main.p
     --n_layers 12 \
     --K 4 \
     --output_dim 10 \
-    --rollout_dt 1.0 \
+    --rollout_dt 0.1 \
     --time_integrator crank_nicolson \
+    --dealias_input 1 \
+    --dealias_rhs 0 \
     --input_noise_scale 0.001 \
     --lr 0.002 \
     --batch_size 10 \
     --num_iterations 200000 \
     --log_every 100 \
-    --eval_every 500 \
+    --eval_every 5000 \
+    --checkpoint_every 5000 \
     --eval_rollout_steps 10 \
     --seed 42
+
+echo ""
+echo "========================================================================="
+echo "  Training complete!"
+echo "========================================================================="

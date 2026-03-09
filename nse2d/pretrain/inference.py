@@ -32,7 +32,7 @@ FIELD_NAMES = ['n', 'U', 'vpar', 'psi', 'Ti']
 
 # Default test set paths
 DEFAULT_MHD_TEST = '/zhangtao/project2026/OmniFluids/nse2d/data/qruio_data/5field_mhd_batch_test/data/5field_mhd_dataset.pt'
-DEFAULT_GRF_TEST = '/zhangtao/project2026/OmniFluids/nse2d/data/grf_testset/grf_testset.pt'
+DEFAULT_GRF_TEST = '/zhangtao/project2026/OmniFluids/nse2d/data/grf_testset/grf_testset_B10_T50_dt1.0_fromdata_radial_dealiased_seed1000.pt'
 
 
 def load_model(ckpt_path, device='cuda:0'):

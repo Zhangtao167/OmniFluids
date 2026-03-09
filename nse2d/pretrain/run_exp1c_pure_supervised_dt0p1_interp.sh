@@ -1,36 +1,43 @@
 #!/bin/bash
 # =============================================================================
-# 实验1b: 纯监督Loss训练 (无PDE loss) - 多卡版本
-# rollout_dt=1.0s (model_dt=1.0s), output_dim=10
-# 使用Offline仿真数据，只用MSE监督loss
-# 训练/评估时间尺度匹配：rollout_dt=dt_data=1.0s → n_substeps=1
+# 实验1c: 纯监督 Loss + 线性插值子步监督 - 多卡版本
+# model_dt=0.1s (rollout_dt=0.1s), dt_data=1.0s
+# 用 x_t 和 x_{t+1} 之间的线性插值，在线采样 10 段 0.1s 一步伪样本
+# 设计上使用 output_dim=1，不做带梯度的10步自回归训练，显存更稳
 # =============================================================================
 
 set -e
 
-source /opt/conda/bin/activate
-conda activate /zhangtao/envs/rae || true
-cd /zhangtao/project2026/OmniFluids/nse2d/pretrain
+# source /opt/conda/bin/activate
+# conda activate /zhangtao/envs/rae || true
+# cd /zhangtao/project2026/OmniFluids/nse2d/pretrain
 
 DATA_PATH="/zhangtao/project2026/OmniFluids/nse2d/data/qruio_data/5field_mhd_batch/data/5field_mhd_dataset.pt"
 EVAL_DATA_PATH="/zhangtao/project2026/OmniFluids/nse2d/data/qruio_data/5field_mhd_batch_test/data/5field_mhd_dataset.pt"
 EVAL_GRF_PATH="/zhangtao/project2026/OmniFluids/nse2d/data/grf_testset/grf_testset_B10_T50_dt1.0_fromdata_radial_dealiased_seed1000.pt"
 
-EXP_NAME="exp1b_pure_supervised_dt1s_multigpu"
+EXP_NAME="exp1c_pure_supervised_dt0p1_interp_multigpu"
 GPUS=${1:-"0,1,2,3"}
 
+IFS=',' read -ra GPU_ARR <<< "$GPUS"
+NUM_PROCESSES=${#GPU_ARR[@]}
+
 echo "========================================================================="
-echo "  实验1b: 纯监督Loss (rollout_dt=1.0s, output_dim=10) - 多卡"
+echo "  实验1c: 纯监督Loss + 线性插值子步监督 (model_dt=0.1s) - 多卡"
 echo "========================================================================="
 echo "  GPUs: $GPUS"
-echo "  rollout_dt=1.0s, dt_data=1.0s → n_substeps=1 (训练/评估时间尺度匹配)"
-echo "  Physics Loss: DISABLED  |  Supervised Loss: MSE (weight=1.0)"
+echo "  num_processes: $NUM_PROCESSES"
+echo "  rollout_dt=0.1s, dt_data=1.0s -> sampled one-step pseudo-pairs from 10 linear segments"
+echo "  Physics Loss: DISABLED"
+echo "  Supervised Loss: MSE (weight=1.0)"
+echo "  Intermediate targets: on-the-fly linear interpolation between x_t and x_{t+1}"
+echo "  output_dim=1 -> training/inference horizons are aligned at 0.1s"
 echo "========================================================================="
 echo ""
 
 export CUDA_VISIBLE_DEVICES=$GPUS
 
-accelerate launch --multi_gpu --num_processes=4 --main_process_port=29503 main.py \
+accelerate launch --multi_gpu --num_processes "$NUM_PROCESSES" --main_process_port=29504 main.py \
     --mode train \
     --use_accelerate 1 \
     --exp_name "$EXP_NAME" \
@@ -43,6 +50,8 @@ accelerate launch --multi_gpu --num_processes=4 --main_process_port=29503 main.p
     --supervised_mse_weight 1.0 \
     --supervised_mae_weight 0.0 \
     --supervised_n_substeps 1 \
+    --supervised_use_interpolation 0 \
+    --supervised_pair_interp_steps 10 \
     --mae_weight 0.0 \
     --grf_use_radial_mask 0 \
     --time_start 250.0 \
@@ -52,14 +61,14 @@ accelerate launch --multi_gpu --num_processes=4 --main_process_port=29503 main.p
     --width 80 \
     --n_layers 12 \
     --K 4 \
-    --output_dim 10 \
-    --rollout_dt 1.0 \
+    --output_dim 1 \
+    --rollout_dt 0.1 \
     --time_integrator crank_nicolson \
     --input_noise_scale 0.001 \
     --lr 0.002 \
     --batch_size 10 \
-    --num_iterations 200000 \
+    --num_iterations 150000 \
     --log_every 100 \
-    --eval_every 500 \
+    --eval_every 1000 \
     --eval_rollout_steps 10 \
     --seed 42

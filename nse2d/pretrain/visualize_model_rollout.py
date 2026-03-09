@@ -1,7 +1,7 @@
-"""Visualize model rollout from GRF initial conditions.
+"""Visualize model rollout and evaluate on test set.
 
-Load a trained model and visualize how it evolves GRF-generated initial conditions
-over multiple time steps.
+Load a trained model, evaluate on simulation test data, compute metrics,
+and generate visualizations.
 """
 
 import os
@@ -15,13 +15,14 @@ import matplotlib.pyplot as plt
 
 sys.path.insert(0, '/zhangtao/project2026/OmniFluids/nse2d/pretrain')
 from model import OmniFluids2D
-from tools import MHD5FieldGRF
+from tools import MHD5FieldGRF, load_mhd5_trajectories, compute_metrics_and_visualize
 
 FIELD_NAMES = ['n', 'U', 'vpar', 'psi', 'Ti']
 
-# Default checkpoint path
-DEFAULT_CKPT = '/zhangtao/project2026/OmniFluids/nse2d/pretrain/results/exp11_grf_staged_multigpu/06fff25a-03_04_11_14_58-K4-mx128-w80-L12-od10/model/latest-06fff25a-03_04_11_14_58-K4-mx128-w80-L12-od10.pt'
-DEFAULT_DATA_PATH = '/zhangtao/project2026/OmniFluids/nse2d/data/qruio_data/5field_mhd_batch/data/5field_mhd_dataset.pt'
+# Default paths
+DEFAULT_CKPT = '/zhangtao/project2026/OmniFluids/nse2d/pretrain/results/mhd5_staged_v1/595fa318-02_25_02_50_50-K4-mx128-w80-L12-od10/model/best-595fa318-02_25_02_50_50-K4-mx128-w80-L12-od10.pt'
+DEFAULT_DATA_PATH = '/zhangtao/project2026/OmniFluids/nse2d/data/qruio_data/5field_mhd_batch_test/data/5field_mhd_dataset.pt'
+DEFAULT_SAVE_DIR = '/zhangtao/project2026/OmniFluids/nse2d/pretrain/vis_rollout'
 
 
 def load_model(ckpt_path, device='cuda:0'):
@@ -96,9 +97,98 @@ def rollout_model(net, x_0, n_steps, device='cuda:0'):
     return trajectory
 
 
+def evaluate_on_testset(net, data_path, n_steps, device='cuda:0',
+                        time_start=250.0, time_end=260.0, dt_data=1.0,
+                        model_dt=0.1, save_dir='./vis_rollout',
+                        sample_idx=0):
+    """Evaluate model on ALL test trajectories and compute metrics.
+    
+    For each trajectory, takes the first frame as initial condition,
+    runs model rollout, aligns with GT at dt_data intervals, then
+    computes metrics averaged over all trajectories.
+    
+    Args:
+        net: OmniFluids2D model
+        data_path: Path to simulation dataset
+        n_steps: Number of rollout steps (NFE)
+        device: Device to run on
+        time_start: Start time of evaluation window (seconds)
+        time_end: End time of evaluation window (seconds)
+        dt_data: Time step in simulation data (default 1.0s)
+        model_dt: Model's time step per NFE (default 0.1s)
+        save_dir: Directory to save results
+        sample_idx: Which sample to visualize (default: 0)
+    
+    Returns:
+        metrics: dict with L2 errors
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # Load ALL trajectories
+    print(f'\n=== Loading Test Data ===')
+    trajectories, meta = load_mhd5_trajectories(
+        data_path, time_start=time_start, time_end=time_end,
+        dt_data=dt_data, single_trajectory=False)
+    # trajectories: (B, T, 5, Nx, Ny) -> channel-last (B, T, Nx, Ny, 5)
+    gt_traj = trajectories.permute(0, 1, 3, 4, 2)  # (B, T, Nx, Ny, 5)
+    B, T_gt, Nx, Ny, n_fields = gt_traj.shape
+    print(f'  GT trajectory shape: {gt_traj.shape} (B={B}, T={T_gt} frames)')
+    
+    # Alignment parameters
+    steps_per_gt_frame = int(round(dt_data / model_dt))
+    n_gt_steps = min(T_gt, n_steps // steps_per_gt_frame + 1)
+    
+    print(f'\n=== Model Rollout (B={B} trajectories, batched) ===')
+    print(f'  {n_steps} NFE (model dt={model_dt}s, total={n_steps * model_dt:.1f}s)')
+    print(f'  Model steps per GT frame: {steps_per_gt_frame}')
+    print(f'  Aligned time steps: {n_gt_steps} (0 to {n_gt_steps-1})')
+    
+    # Batch all B initial conditions and rollout in parallel
+    x_0_batch = gt_traj[:, 0].to(device)  # (B, Nx, Ny, 5)
+    current = x_0_batch
+    
+    # Collect aligned frames: list of (B, Nx, Ny, 5)
+    aligned_frames = [x_0_batch.cpu()]
+    frame_counter = 1
+    
+    with torch.no_grad():
+        for s in range(1, n_steps + 1):
+            out = net(current, inference=True)  # (B, Nx, Ny, 5, 1)
+            current = out[..., -1]               # (B, Nx, Ny, 5)
+            if s % steps_per_gt_frame == 0 and frame_counter < n_gt_steps:
+                aligned_frames.append(current.cpu())
+                frame_counter += 1
+            if s % 10 == 0 or s == n_steps:
+                print(f'    Step {s}/{n_steps} (collected {frame_counter}/{n_gt_steps} aligned frames)')
+    
+    # Stack: (n_gt_steps, B, Nx, Ny, 5) -> transpose to (B, n_gt_steps, Nx, Ny, 5)
+    pred_aligned = torch.stack(aligned_frames, dim=0).permute(1, 0, 2, 3, 4).numpy()
+    gt_aligned = gt_traj[:, :n_gt_steps].numpy()
+    
+    print(f'\n=== Aligning Trajectories ===')
+    print(f'  GT aligned shape: {gt_aligned.shape}')
+    print(f'  Pred aligned shape: {pred_aligned.shape}')
+    
+    # Compute metrics and visualize
+    print(f'\n=== Computing Metrics and Visualizing ===')
+    metrics = compute_metrics_and_visualize(
+        gt_traj=gt_aligned,
+        pred_traj=pred_aligned,
+        metric_step_list=[1, 3, 5, 10] if n_gt_steps > 10 else list(range(1, n_gt_steps)),
+        plot_step_list=[0, 1, 3, 5, 10] if n_gt_steps > 10 else list(range(n_gt_steps)),
+        visualize=True,
+        save_dir=save_dir,
+        time_start=time_start,
+        dt_data=dt_data,
+        sample_idx=sample_idx
+    )
+    
+    return metrics
+
+
 def visualize_trajectory(trajectory, rollout_dt=0.1, save_dir='./vis_rollout', 
                          sample_idx=0, n_vis_steps=None):
-    """Visualize trajectory evolution.
+    """Visualize trajectory evolution (for GRF rollout mode).
     
     Args:
         trajectory: list of (B, Nx, Ny, 5) states
@@ -144,7 +234,7 @@ def visualize_trajectory(trajectory, rollout_dt=0.1, save_dir='./vis_rollout',
     
     fig.suptitle(f'Model Rollout: GRF -> {(n_total-1)*rollout_dt:.1f}s ({n_total-1} NFE)', fontsize=14)
     plt.tight_layout()
-    save_path = os.path.join(save_dir, 'trajectory_fields.png')
+    save_path = os.path.join(save_dir, 'grf_trajectory_fields.png')
     plt.savefig(save_path, dpi=150)
     plt.close(fig)
     print(f'Saved: {save_path}')
@@ -171,7 +261,7 @@ def visualize_trajectory(trajectory, rollout_dt=0.1, save_dir='./vis_rollout',
     axes[5].axis('off')
     fig.suptitle('Per-field Mean Energy Evolution', fontsize=14)
     plt.tight_layout()
-    save_path = os.path.join(save_dir, 'energy_evolution.png')
+    save_path = os.path.join(save_dir, 'grf_energy_evolution.png')
     plt.savefig(save_path, dpi=150)
     plt.close(fig)
     print(f'Saved: {save_path}')
@@ -202,12 +292,12 @@ def visualize_trajectory(trajectory, rollout_dt=0.1, save_dir='./vis_rollout',
     
     fig.suptitle(f'GRF Input vs Model Output after {n_total-1} NFE', fontsize=14)
     plt.tight_layout()
-    save_path = os.path.join(save_dir, 'initial_vs_final.png')
+    save_path = os.path.join(save_dir, 'grf_initial_vs_final.png')
     plt.savefig(save_path, dpi=150)
     plt.close(fig)
     print(f'Saved: {save_path}')
     
-    print(f'\nAll visualizations saved to: {save_dir}/')
+    print(f'\nAll GRF visualizations saved to: {save_dir}/')
 
 
 def main(args):
@@ -216,55 +306,111 @@ def main(args):
     # Load model
     net, saved_cfg = load_model(args.checkpoint, device=device)
     
-    # Build GRF generator
-    Nx = saved_cfg.get('Nx', 512)
-    Ny = saved_cfg.get('Ny', 256)
-    grf = build_grf_generator(args.data_path, device=device, Nx=Nx, Ny=Ny)
-    
-    # Generate GRF initial condition
-    print(f'\nGenerating GRF initial condition (batch_size={args.batch_size})...')
-    torch.manual_seed(args.seed)
-    x_0 = grf(args.batch_size)  # (B, Nx, Ny, 5)
-    print(f'  GRF shape: {x_0.shape}')
-    
-    # Rollout
-    print(f'\nRolling out model for {args.n_steps} steps...')
-    rollout_dt = saved_cfg.get('rollout_dt', 0.1)
-    trajectory = rollout_model(net, x_0, args.n_steps, device=device)
-    print(f'  Trajectory: {len(trajectory)} states, total time = {(len(trajectory)-1)*rollout_dt:.1f}s')
-    
-    # Visualize
-    print(f'\nGenerating visualizations...')
-    visualize_trajectory(
-        trajectory, 
-        rollout_dt=rollout_dt,
-        save_dir=args.save_dir,
-        sample_idx=args.sample_idx,
-        n_vis_steps=args.n_vis_steps)
+    if args.mode == 'testset':
+        # =====================================================
+        # Mode: Evaluate on simulation test set
+        # =====================================================
+        print('\n' + '=' * 60)
+        print('MODE: Test Set Evaluation')
+        print('=' * 60)
+        
+        # Get model dt from config (default 0.1)
+        model_dt = saved_cfg.get('rollout_dt', 0.1)
+        print(f'  Model rollout_dt from config: {model_dt}s')
+        
+        metrics = evaluate_on_testset(
+            net=net,
+            data_path=args.data_path,
+            n_steps=args.n_steps,
+            device=device,
+            time_start=args.time_start,
+            time_end=args.time_end,
+            dt_data=args.dt_data,
+            model_dt=model_dt,
+            save_dir=args.save_dir,
+            sample_idx=args.sample_idx
+        )
+        
+        print('\n' + '=' * 60)
+        print('Evaluation Complete!')
+        print('=' * 60)
+        print(f'\nResults saved to: {args.save_dir}/')
+        
+    else:
+        # =====================================================
+        # Mode: GRF rollout visualization
+        # =====================================================
+        print('\n' + '=' * 60)
+        print('MODE: GRF Rollout Visualization')
+        print('=' * 60)
+        
+        # Build GRF generator
+        Nx = saved_cfg.get('Nx', 512)
+        Ny = saved_cfg.get('Ny', 256)
+        grf = build_grf_generator(args.data_path, device=device, Nx=Nx, Ny=Ny)
+        
+        # Generate GRF initial condition
+        print(f'\nGenerating GRF initial condition (batch_size={args.batch_size})...')
+        torch.manual_seed(args.seed)
+        x_0 = grf(args.batch_size)  # (B, Nx, Ny, 5)
+        print(f'  GRF shape: {x_0.shape}')
+        
+        # Rollout
+        print(f'\nRolling out model for {args.n_steps} steps...')
+        rollout_dt = saved_cfg.get('rollout_dt', 0.1)
+        trajectory = rollout_model(net, x_0, args.n_steps, device=device)
+        print(f'  Trajectory: {len(trajectory)} states, total time = {(len(trajectory)-1)*rollout_dt:.1f}s')
+        
+        # Visualize
+        print(f'\nGenerating visualizations...')
+        visualize_trajectory(
+            trajectory, 
+            rollout_dt=rollout_dt,
+            save_dir=args.save_dir,
+            sample_idx=args.sample_idx,
+            n_vis_steps=args.n_vis_steps)
     
     print('\nDone!')
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Visualize model rollout from GRF')
+    parser = argparse.ArgumentParser(description='Evaluate model and visualize rollout')
+    
+    # Mode selection
+    parser.add_argument('--mode', type=str, default='testset', choices=['testset', 'grf'],
+                        help='Evaluation mode: testset (compare with simulation) or grf (random init)')
+    
+    # Paths
     parser.add_argument('--checkpoint', type=str, default=DEFAULT_CKPT,
                         help='Path to model checkpoint')
     parser.add_argument('--data_path', type=str, default=DEFAULT_DATA_PATH,
-                        help='Path to data for GRF stats')
-    parser.add_argument('--n_steps', type=int, default=50,
-                        help='Number of model inference steps (NFE)')
-    parser.add_argument('--batch_size', type=int, default=4,
-                        help='Number of GRF samples to generate')
-    parser.add_argument('--sample_idx', type=int, default=0,
-                        help='Which sample in batch to visualize')
-    parser.add_argument('--n_vis_steps', type=int, default=6,
-                        help='Number of time steps to show in trajectory plot')
-    parser.add_argument('--save_dir', type=str, default='./vis_rollout',
-                        help='Directory to save visualizations')
-    parser.add_argument('--seed', type=int, default=42,
-                        help='Random seed for GRF generation')
+                        help='Path to simulation dataset')
+    parser.add_argument('--save_dir', type=str, default=DEFAULT_SAVE_DIR,
+                        help='Directory to save results')
+    
+    # Rollout settings
+    parser.add_argument('--n_steps', type=int, default=100,
+                        help='Number of model inference steps (NFE). For testset mode, use 100 for 10s.')
     parser.add_argument('--device', type=str, default='cuda:0',
                         help='Device to run on')
+    
+    # Test set mode settings
+    parser.add_argument('--time_start', type=float, default=250.0,
+                        help='Start time for test set evaluation (seconds)')
+    parser.add_argument('--time_end', type=float, default=260.0,
+                        help='End time for test set evaluation (seconds)')
+    parser.add_argument('--dt_data', type=float, default=1.0,
+                        help='Time step in simulation data (seconds)')
+    parser.add_argument('--sample_idx', type=int, default=0,
+                        help='Which sample to visualize')
+    
+    # GRF mode settings
+    parser.add_argument('--batch_size', type=int, default=4,
+                        help='Number of GRF samples to generate (GRF mode)')
+    parser.add_argument('--n_vis_steps', type=int, default=6,
+                        help='Number of time steps to show in GRF trajectory plot')
+    parser.add_argument('--seed', type=int, default=42,
+                        help='Random seed for GRF generation')
     
     args = parser.parse_args()
     main(args)
