@@ -24,7 +24,7 @@ class FeedForward(nn.Module):
             out_dim = dim if i == n_layers - 1 else dim * factor
             self.layers.append(nn.Sequential(
                 nn.Linear(in_dim, out_dim),
-                nn.ReLU(inplace=True) if i < n_layers - 1 else nn.Identity(),
+                nn.ReLU(inplace=False) if i < n_layers - 1 else nn.Identity(),
                 nn.LayerNorm(out_dim) if layer_norm and i == n_layers - 1
                 else nn.Identity(),
             ))
@@ -257,7 +257,7 @@ class OmniFluids2D(nn.Module):
         x = F.gelu(x)
 
         if params is None:
-            params = self.default_params.unsqueeze(0).expand(B, -1)
+            params = self.default_params.unsqueeze(0).expand(B, -1).clone()
 
         for i in range(self.n_layers):
             att = self.f_nu[i](params)

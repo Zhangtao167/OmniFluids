@@ -5,6 +5,7 @@ and the physical RHS (right-hand side) from the 5-field Landau-fluid equations.
 """
 
 import sys
+import math
 import torch
 import torch.nn.functional as F
 
@@ -72,9 +73,19 @@ def build_mhd_instance(device='cpu', Nx=512, Ny=256):
     return mhd
 
 
+def compute_target_rms_scale(target, eps=1e-8):
+    """Compute detached per-field RMS scale from the target RHS.
+
+    Using the target magnitude keeps the relative loss sensitive to actual
+    error reduction, unlike normalizing by the residual's own scale.
+    """
+    return target.detach().pow(2).mean(dim=(0, 1, 2), keepdim=True).sqrt().clamp(min=eps)
+
+
 def compute_physics_loss(pred_traj, x_0, rhs_fn, rollout_dt, output_dim,
                          time_integrator='crank_nicolson', mae_weight=0.0,
-                         euler_weight=None):
+                         soft_linf_weight=0.0, soft_linf_beta=10.0,
+                         euler_weight=None, use_relative_loss=False):
     """Multi-frame physics loss using mhd_sim's RHS.
 
     For each consecutive frame pair in the trajectory, enforce:
@@ -82,7 +93,19 @@ def compute_physics_loss(pred_traj, x_0, rhs_fn, rollout_dt, output_dim,
 
     where target_rhs depends on the time integrator.
 
-    Total loss = MSE + mae_weight * MAE  (per-frame averaged).
+    Total loss = MSE + mae_weight * MAE + soft_linf_weight * soft-L∞ (per-frame averaged).
+
+    When use_relative_loss=True, the MSE/MAE terms are computed on
+    residual / target_rms_per_field, where target_rms_per_field is detached
+    and computed from the RHS target over batch and spatial dimensions.
+
+    The soft-L∞ loss uses the Log-Sum-Exp (LSE) smooth approximation:
+        soft-L∞_c = (1/β) * (logsumexp(β * |r̃_c|) - ln(N_spatial))
+    where r̃_c = |residual_c| / scale_c is the field-normalized residual.
+    If use_relative_loss=True, scale_c = RMS(target_c).detach().
+    Otherwise, scale_c = RMS(residual_c).detach(),
+    and β controls sharpness (larger β → closer to true L∞).
+    Computed per-sample, per-field, then averaged over batch and summed over fields.
 
     Args:
         pred_traj: (B, Nx, Ny, 5, output_dim) multi-frame model output
@@ -92,10 +115,14 @@ def compute_physics_loss(pred_traj, x_0, rhs_fn, rollout_dt, output_dim,
         output_dim: number of predicted frames
         time_integrator: 'euler' or 'crank_nicolson' (used when euler_weight is None)
         mae_weight: weight for the additional MAE loss term (default 0 = off)
+        soft_linf_weight: weight for soft-L∞ loss term (default 0 = off)
+        soft_linf_beta: β parameter for soft-L∞ approximation (default 10.0)
         euler_weight: If not None, enables mixed mode:
             - Computes both Euler and CN losses separately
             - Returns combined loss = euler_weight * euler_loss + (1 - euler_weight) * cn_loss
             - Also returns individual losses as dict
+        use_relative_loss: If True, normalize residual by detached per-field
+            RMS of the target RHS before computing MSE/MAE
 
     Returns:
         If euler_weight is None: scalar loss
@@ -117,14 +144,22 @@ def compute_physics_loss(pred_traj, x_0, rhs_fn, rollout_dt, output_dim,
             # Euler target: rhs(t)
             rhs_t = rhs_fn(state_t)
             target_euler = rhs_t.detach()
-            total_euler_mse = total_euler_mse + F.mse_loss(time_diff, target_euler)
+            residual_euler = time_diff - target_euler
+            if use_relative_loss:
+                target_scale = compute_target_rms_scale(target_euler)
+                residual_euler = residual_euler / target_scale
+            total_euler_mse = total_euler_mse + (residual_euler ** 2).mean()
             
             # CN target: (rhs(t) + rhs(t+1)) / 2
             # Only compute rhs_tp1 if we need CN loss (euler_weight < 1)
             if euler_weight < 1.0 - 1e-6:
                 rhs_tp1 = rhs_fn(state_tp1)
                 target_cn = ((rhs_t + rhs_tp1) / 2.0).detach()
-                total_cn_mse = total_cn_mse + F.mse_loss(time_diff, target_cn)
+                residual_cn = time_diff - target_cn
+                if use_relative_loss:
+                    target_scale = compute_target_rms_scale(target_cn)
+                    residual_cn = residual_cn / target_scale
+                total_cn_mse = total_cn_mse + (residual_cn ** 2).mean()
         
         euler_loss = total_euler_mse / output_dim
         
@@ -141,6 +176,7 @@ def compute_physics_loss(pred_traj, x_0, rhs_fn, rollout_dt, output_dim,
     # Original single-integrator mode
     total_mse = torch.tensor(0.0, device=x_0.device, dtype=x_0.dtype)
     total_mae = torch.tensor(0.0, device=x_0.device, dtype=x_0.dtype)
+    total_soft_linf = torch.tensor(0.0, device=x_0.device, dtype=x_0.dtype)
 
     for t in range(output_dim):
         state_t = full_traj[..., t]
@@ -155,11 +191,39 @@ def compute_physics_loss(pred_traj, x_0, rhs_fn, rollout_dt, output_dim,
             raise ValueError(f"Unknown integrator: {time_integrator}")
 
         target = target.detach()
-        total_mse = total_mse + F.mse_loss(time_diff, target)
+        residual = time_diff - target  # (B, Nx, Ny, 5)
+        target_scale = None
+        if use_relative_loss:
+            target_scale = compute_target_rms_scale(target)
+            residual = residual / target_scale
+        total_mse = total_mse + (residual ** 2).mean()
         if mae_weight > 0:
-            total_mae = total_mae + F.l1_loss(time_diff, target)
+            total_mae = total_mae + torch.abs(residual).mean()
+        
+        # Soft-L∞ loss: per-sample, per-field, normalized by either
+        # target RMS (relative mode) or residual RMS (legacy mode).
+        if soft_linf_weight > 0:
+            soft_linf_residual = time_diff - target  # (B, Nx, Ny, 5)
+            B_size = soft_linf_residual.shape[0]
+            N_spatial = soft_linf_residual.shape[1] * soft_linf_residual.shape[2]  # Nx * Ny
+            ln_N = math.log(N_spatial)
+            for c in range(5):
+                abs_res_c = torch.abs(soft_linf_residual[..., c])  # (B, Nx, Ny)
+                if use_relative_loss:
+                    scale_c = target_scale[..., c]
+                else:
+                    scale_c = abs_res_c.detach().pow(2).mean().sqrt().clamp(min=1e-8)
+                normed = abs_res_c / scale_c  # (B, Nx, Ny)
+                # logsumexp per sample over spatial dims, then batch mean
+                per_sample = (1.0 / soft_linf_beta) * (
+                    torch.logsumexp(soft_linf_beta * normed.reshape(B_size, -1), dim=1)
+                    - ln_N
+                )  # (B,)
+                total_soft_linf = total_soft_linf + per_sample.mean()
 
     loss = total_mse / output_dim
     if mae_weight > 0:
         loss = loss + mae_weight * (total_mae / output_dim)
+    if soft_linf_weight > 0:
+        loss = loss + soft_linf_weight * (total_soft_linf / output_dim)
     return loss

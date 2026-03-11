@@ -265,6 +265,12 @@ if __name__ == "__main__":
                         help='Scale of additive Gaussian noise on training input')
     parser.add_argument('--mae_weight', type=float, default=0.0,
                         help='Weight for MAE loss term (0=off, e.g. 0.1)')
+    parser.add_argument('--soft_linf_weight', type=float, default=0.0,
+                        help='Weight for soft-L∞ loss in PDE loss (0=off, e.g. 0.02)')
+    parser.add_argument('--soft_linf_beta', type=float, default=10.0,
+                        help='β parameter for soft-L∞ (larger = closer to true L∞)')
+    parser.add_argument('--use_relative_loss', type=int, default=0,
+                        help='1=normalize PDE residual by target per-field RMS before MSE/MAE')
     parser.add_argument('--supervised_loss_weight', type=float, default=0.0,
                         help='Weight for supervised loss on real data (0=off, e.g. 1.0)')
     parser.add_argument('--supervised_mse_weight', type=float, default=1.0,
@@ -284,7 +290,12 @@ if __name__ == "__main__":
     parser.add_argument('--physics_loss_weight', type=float, default=1.0,
                         help='Weight for PDE physics loss (default=1.0, set 0 to disable)')
 
-    parser.add_argument('--lr', type=float, default=0.002)
+    parser.add_argument('--lr', type=float, default=0.001,
+                        help='Initial (peak) learning rate (default=1e-3)')
+    parser.add_argument('--lr_end', type=float, default=1e-7,
+                        help='Final learning rate at end of training (default=1e-7)')
+    parser.add_argument('--lr_step_interval', type=int, default=500,
+                        help='Update LR every N training steps (default=500)')
     parser.add_argument('--weight_decay', type=float, default=0.0)
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--num_iterations', type=int, default=20000)
@@ -340,6 +351,14 @@ if __name__ == "__main__":
                         help='Gradient accumulation steps for GRF optimizer (default=1)')
     parser.add_argument('--learnable_grf_log_every', type=int, default=1000,
                         help='Log GRF parameters every N steps (default=1000)')
+
+    # Multi-step PDE loss: rollout multiple times and accumulate PDE losses
+    parser.add_argument('--multi_step_pde_loss', type=int, default=0,
+                        help='Enable multi-step rollout PDE loss (0=off, 1=on)')
+    parser.add_argument('--multi_step_pde_n', type=int, default=2,
+                        help='Number of autoregressive rollout steps (default=2)')
+    parser.add_argument('--multi_step_pde_detach', type=int, default=0,
+                        help='Detach intermediate inputs (0=full gradient, 1=detach)')
 
     # Self-training mode: use training model itself to generate data
     parser.add_argument('--self_training_start_step', type=int, default=0,

@@ -7,6 +7,7 @@ Evaluation: autoregressive rollout with relative L2 error + visualization.
 import os
 import sys
 import json
+import math
 import time
 import numpy as np
 import torch
@@ -378,7 +379,8 @@ def evaluate_grf_overfitting(config, net, grf_data, rhs_fn, step_tag='eval', n_e
                 rollout_dt=config.rollout_dt,
                 output_dim=config.output_dim,
                 time_integrator=config.time_integrator,
-                mae_weight=0.0)
+                mae_weight=0.0,
+                use_relative_loss=getattr(config, 'use_relative_loss', 0) == 1)
             phys_losses.append(phys_loss.item())
             
             # Per-field RMS of predictions
@@ -755,10 +757,67 @@ def _make_self_training_generator(grf, training_net, config, device='cpu', verbo
         generator_net, grf, rollout_steps=rollout_steps, device=device, verbose=verbose)
 
 
-def _make_scheduler(optimizer, lr, total_steps):
-    """Create a fresh OneCycleLR scheduler."""
-    return optim.lr_scheduler.OneCycleLR(
-        optimizer, max_lr=lr, total_steps=total_steps + 1)
+def _make_scheduler(optimizer, lr_start, lr_end, total_steps, step_interval=500):
+    """Cosine-power annealing: lr_start -> lr_end over total_steps.
+
+    lr(t) = lr_end + (lr_start - lr_end) * ((1 + cos(π·progress)) / 2)^p
+
+    Power p ≈ 3.322 is chosen so that lr(T/2) ≈ 0.1 × lr_start.
+    LR is held constant within each step_interval block (staircase).
+    """
+    p = math.log(0.1) / math.log(0.5)  # ≈ 3.322
+    n_intervals = max(total_steps // step_interval, 1)
+
+    def lr_lambda(step):
+        idx = min(step // step_interval, n_intervals)
+        progress = idx / n_intervals
+        cosine_val = (1.0 + math.cos(math.pi * progress)) / 2.0
+        decay = cosine_val ** p
+        return (lr_end + (lr_start - lr_end) * decay) / lr_start
+
+    return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
+def _plot_lr_schedule(lr_start, lr_end, total_steps, step_interval, save_path):
+    """Plot the LR schedule and save to file."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    p = math.log(0.1) / math.log(0.5)
+    n_intervals = max(total_steps // step_interval, 1)
+
+    steps, lrs = [], []
+    for s in range(0, total_steps + 1, max(step_interval, 1)):
+        idx = min(s // step_interval, n_intervals)
+        progress = idx / n_intervals
+        cosine_val = (1.0 + math.cos(math.pi * progress)) / 2.0
+        lr = lr_end + (lr_start - lr_end) * (cosine_val ** p)
+        steps.append(s)
+        lrs.append(lr)
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(steps, lrs, 'b-', linewidth=1.5)
+    ax.set_xlabel('Training Step')
+    ax.set_ylabel('Learning Rate')
+    ax.set_yscale('log')
+    ax.grid(True, alpha=0.3)
+
+    half = total_steps // 2
+    half_idx = min(half // step_interval, n_intervals)
+    half_lr = lr_end + (lr_start - lr_end) * (
+        ((1.0 + math.cos(math.pi * half_idx / n_intervals)) / 2.0) ** p)
+    ax.axvline(x=half, color='r', linestyle='--', alpha=0.5)
+    ax.annotate(f'T/2: {half_lr:.2e}', xy=(half, half_lr),
+                xytext=(half + total_steps * 0.05, half_lr * 5),
+                arrowprops=dict(arrowstyle='->', color='red'),
+                fontsize=9, color='red')
+    ax.set_title(f'LR schedule: {lr_start:.1e} → {lr_end:.1e}  '
+                 f'(cosine-power p={p:.2f}, Δ={step_interval})')
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150)
+    plt.close(fig)
+    print(f'  LR schedule plot saved to {save_path}')
 
 
 class _OfflineSampler:
@@ -864,38 +923,77 @@ def _train_step(net, x_0, rhs_fn, optimizer, scheduler, config, x_target=None,
     if getattr(config, 'dealias_input', True) and mhd is not None:
         x_0 = dealias_state(mhd, x_0)
     
-    pred_traj = net(x_0)
-
     # Physics loss (PDE loss)
     phys_loss_weight = getattr(config, 'physics_loss_weight', 1.0)
     loss_components = {}
     
+    # Multi-step PDE loss configuration
+    use_multi_step = bool(getattr(config, 'multi_step_pde_loss', 0)) and phys_loss_weight > 0
+    multi_step_n = getattr(config, 'multi_step_pde_n', 2) if use_multi_step else 1
+    multi_step_detach = bool(getattr(config, 'multi_step_pde_detach', 0))
+    
     if phys_loss_weight > 0:
+        # Accumulate PDE losses over multi-step rollout
+        total_phys_loss = torch.tensor(0.0, device=x_0.device, dtype=x_0.dtype)
+        current_input = x_0
+        pred_traj = None  # Will be set in the loop
+        
+        # For mixed integrator mode, accumulate component losses
+        total_euler_loss = 0.0
+        total_cn_loss = 0.0
+        
+        for step_i in range(multi_step_n):
+            # Forward pass
+            pred_traj = net(current_input)
+            
+            # Compute PDE loss for this step
+            if euler_weight is not None:
+                # Mixed integrator mode
+                step_phys_loss, integrator_losses = compute_physics_loss(
+                    pred_traj, current_input, rhs_fn,
+                    rollout_dt=config.rollout_dt,
+                    output_dim=config.output_dim,
+                    time_integrator=config.time_integrator,
+                    mae_weight=getattr(config, 'mae_weight', 0.0),
+                    euler_weight=euler_weight,
+                    use_relative_loss=getattr(config, 'use_relative_loss', 0) == 1)
+                total_euler_loss += integrator_losses['euler']
+                total_cn_loss += integrator_losses['cn']
+            else:
+                # Single integrator mode
+                step_phys_loss = compute_physics_loss(
+                    pred_traj, current_input, rhs_fn,
+                    rollout_dt=config.rollout_dt,
+                    output_dim=config.output_dim,
+                    time_integrator=config.time_integrator,
+                    mae_weight=getattr(config, 'mae_weight', 0.0),
+                    soft_linf_weight=getattr(config, 'soft_linf_weight', 0.0),
+                    soft_linf_beta=getattr(config, 'soft_linf_beta', 10.0),
+                    use_relative_loss=getattr(config, 'use_relative_loss', 0) == 1)
+            
+            # Accumulate loss (no averaging across steps)
+            total_phys_loss = total_phys_loss + step_phys_loss
+            
+            # Prepare input for next step (if not the last step)
+            if step_i < multi_step_n - 1:
+                # Use .clone() to avoid inplace modification issues during backprop
+                next_input = pred_traj[..., -1].clone()  # Take last frame (clone to avoid inplace issues)
+                if multi_step_detach:
+                    next_input = next_input.detach()
+                current_input = next_input
+        
+        phys_loss = total_phys_loss
+        loss_components['phys'] = phys_loss.item()
+        loss_components['multi_step_n'] = multi_step_n
+        
         if euler_weight is not None:
-            # Mixed integrator mode: returns (combined_loss, {'euler': ..., 'cn': ...})
-            phys_loss, integrator_losses = compute_physics_loss(
-                pred_traj, x_0, rhs_fn,
-                rollout_dt=config.rollout_dt,
-                output_dim=config.output_dim,
-                time_integrator=config.time_integrator,
-                mae_weight=getattr(config, 'mae_weight', 0.0),
-                euler_weight=euler_weight)
-            loss_components['phys'] = phys_loss.item()
-            loss_components['euler_loss'] = integrator_losses['euler']
-            loss_components['cn_loss'] = integrator_losses['cn']
+            loss_components['euler_loss'] = total_euler_loss
+            loss_components['cn_loss'] = total_cn_loss
             loss_components['euler_weight'] = euler_weight
-        else:
-            # Single integrator mode
-            phys_loss = compute_physics_loss(
-                pred_traj, x_0, rhs_fn,
-                rollout_dt=config.rollout_dt,
-                output_dim=config.output_dim,
-                time_integrator=config.time_integrator,
-                mae_weight=getattr(config, 'mae_weight', 0.0))
-            loss_components['phys'] = phys_loss.item()
         
         total_loss = phys_loss_weight * phys_loss
     else:
+        pred_traj = net(x_0)  # Still need pred_traj for supervised loss
         total_loss = torch.tensor(0.0, device=pred_traj.device, dtype=pred_traj.dtype)
         loss_components['phys'] = 0.0
     
@@ -1410,7 +1508,17 @@ def train(config, net, accelerator=None):
     net = net.to(device)
     optimizer = optim.Adam(net.parameters(), lr=config.lr,
                            weight_decay=config.weight_decay)
-    scheduler = _make_scheduler(optimizer, config.lr, config.num_iterations)
+    lr_end = getattr(config, 'lr_end', 1e-7)
+    lr_step_interval = getattr(config, 'lr_step_interval', 500)
+    scheduler = _make_scheduler(optimizer, config.lr, lr_end,
+                                config.num_iterations, lr_step_interval)
+
+    # Plot LR schedule once at training start
+    if is_main_process:
+        lr_plot_path = os.path.join(config.run_dir, 'vis', 'lr_schedule.png')
+        os.makedirs(os.path.dirname(lr_plot_path), exist_ok=True)
+        _plot_lr_schedule(config.lr, lr_end, config.num_iterations,
+                          lr_step_interval, lr_plot_path)
 
     # Wrap with Accelerator if using multi-GPU
     if accelerator is not None:
@@ -1489,6 +1597,8 @@ def train(config, net, accelerator=None):
         
         print(f'\n[{run_tag}] Training: {config.num_iterations} iters, '
               f'bs={config.batch_size}, lr={config.lr}')
+        print(f'  LR schedule: {config.lr:.1e} → {lr_end:.1e} '
+              f'(cosine-power, step_interval={lr_step_interval})')
         print('-' * 60)
         sys.stdout.flush()
 
@@ -1587,7 +1697,8 @@ def train(config, net, accelerator=None):
         # Staged mode: reset scheduler at the transition point
         if data_mode == 'staged' and prev_source == 'online' and source == 'offline':
             remaining = config.num_iterations - global_step
-            scheduler = _make_scheduler(optimizer, config.lr, remaining)
+            scheduler = _make_scheduler(optimizer, config.lr, lr_end,
+                                        remaining, lr_step_interval)
             # Wrap with accelerator if using multi-GPU (must be done on all processes)
             if accelerator is not None:
                 scheduler = accelerator.prepare(scheduler)
