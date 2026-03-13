@@ -1,13 +1,9 @@
 #!/bin/bash
 # =============================================================================
-# Exp13: GRF + Self-Training (Multi-GPU via Accelerate)
+# Exp15: Multi-step PDE Loss (对标 exp14，但不使用 learnable GRF)
 # 
-# Phase 1 (steps 0-99999): Pure GRF training with physics loss
-# Phase 2 (steps 100000+): Self-training mode
-#   - GRF -> Model(3 steps) -> evolved state as training input
-#   - Model weights refreshed every 20000 steps
-# 
-# Time integrator: Crank-Nicolson (fixed)
+# 验证多步 rollout PDE loss 是否有助于训练
+# 配置：rollout 2 步，不 detach 中间状态（完整梯度链）
 # =============================================================================
 
 set -e
@@ -18,41 +14,40 @@ DATA_PATH="/zhangtao/project2026/OmniFluids/nse2d/data/qruio_data/5field_mhd_bat
 EVAL_DATA_PATH="/zhangtao/project2026/OmniFluids/nse2d/data/qruio_data/5field_mhd_batch_test/data/5field_mhd_dataset.pt"
 EVAL_GRF_DATA_PATH="/zhangtao/project2026/OmniFluids/nse2d/data/grf_testset/grf_testset_B10_T50_dt1.0_fromdata_radial_dealiased_seed1000.pt"
 
-EXP_NAME="exp13_grf_self_training"
+EXP_NAME="exp15_multistep_pde"
 GPU_IDS=${1:-"0,1,2,3"}
 NUM_GPUS=$(echo "$GPU_IDS" | tr ',' '\n' | wc -l)
 
-# Training configuration
+# Training configuration (对标 exp14)
 NUM_ITERATIONS=200000
-SELF_TRAINING_START=100000
-SELF_TRAINING_UPDATE_EVERY=20000
-SELF_TRAINING_ROLLOUT_STEPS=3
+
+# Multi-step PDE loss configuration
+MULTI_STEP_N=2
+MULTI_STEP_DETACH=0  # 0=完整梯度链
 
 echo "========================================================================="
-echo "  Exp13: GRF + Self-Training (Multi-GPU via Accelerate)"
+echo "  Exp15: Multi-step PDE Loss (对标 exp14，无 learnable GRF)"
 echo "========================================================================="
 echo "  GPU_IDS: $GPU_IDS"
 echo "  NUM_GPUS: $NUM_GPUS"
 echo ""
-echo "  Phase 1: steps 0-$((SELF_TRAINING_START-1))"
-echo "    - Pure GRF input, PDE loss (Crank-Nicolson)"
-echo ""
-echo "  Phase 2: steps ${SELF_TRAINING_START}-$((NUM_ITERATIONS-1))"
-echo "    - Self-training: GRF -> Model($SELF_TRAINING_ROLLOUT_STEPS steps) -> input"
-echo "    - Model weights updated every $SELF_TRAINING_UPDATE_EVERY steps"
-echo ""
-echo "  Time integrator: Crank-Nicolson (fixed)"
+echo "  Multi-step PDE loss: N=$MULTI_STEP_N, detach=$MULTI_STEP_DETACH"
+echo "  Time integrator: Crank-Nicolson"
+echo "  与 exp14 的区别: 使用 multi-step PDE loss，不使用 learnable GRF"
 echo "========================================================================="
 echo ""
 
-# Use accelerate launch for multi-GPU with specified GPUs
-CUDA_VISIBLE_DEVICES=$GPU_IDS /zhangtao/envs/rae/bin/accelerate launch \
-    --multi_gpu \
+# Use accelerate launch for multi-GPU
+export CUDA_VISIBLE_DEVICES=$GPU_IDS
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+/zhangtao/envs/rae/bin/accelerate launch --multi_gpu \
     --num_processes=$NUM_GPUS \
     --mixed_precision=no \
-    --main_process_port=29513 \
+    --main_process_port=29515 \
     main.py \
     --mode train \
+    --use_accelerate 1 \
     --exp_name "$EXP_NAME" \
     --data_path "$DATA_PATH" \
     --eval_data_path "$EVAL_DATA_PATH" \
@@ -63,9 +58,10 @@ CUDA_VISIBLE_DEVICES=$GPU_IDS /zhangtao/envs/rae/bin/accelerate launch \
     --supervised_loss_weight 0.0 \
     --mae_weight 0.0 \
     --grf_use_radial_mask 1 \
-    --self_training_start_step $SELF_TRAINING_START \
-    --self_training_update_every $SELF_TRAINING_UPDATE_EVERY \
-    --self_training_rollout_steps $SELF_TRAINING_ROLLOUT_STEPS \
+    --multi_step_pde_loss 1 \
+    --multi_step_pde_n $MULTI_STEP_N \
+    --multi_step_pde_detach $MULTI_STEP_DETACH \
+    --learnable_grf 0 \
     --time_start 250.0 \
     --time_end 300.0 \
     --dt_data 1.0 \
@@ -82,8 +78,8 @@ CUDA_VISIBLE_DEVICES=$GPU_IDS /zhangtao/envs/rae/bin/accelerate launch \
     --lr_end 1e-7 \
     --batch_size 10 \
     --num_iterations $NUM_ITERATIONS \
-    --log_every 500 \
-    --eval_every 5000 \
+    --log_every 100 \
+    --eval_every 2000 \
     --eval_rollout_steps 10 \
-    --seed 42 \
-    --use_accelerate 1
+    --checkpoint_every 10000 \
+    --seed 42

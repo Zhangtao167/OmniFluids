@@ -1,10 +1,22 @@
 #!/bin/bash
 # =============================================================================
-# Exp14: Learnable GRF (Multi-GPU via Accelerate)
+# Exp21: Learnable GRF (10k) + Soft-L∞ Loss + Multi-Step PDE Loss
 # 
-# Phase 1 (steps 0-19999): Pure GRF training with physics loss
+# Based on exp20, with multi-step autoregressive PDE loss enabled.
+# 
+# KEY DIFFERENCE from exp20:
+#   - multi_step_pde_loss=1: Enable multi-step rollout training
+#   - multi_step_pde_n=3: Train with 3-step autoregressive rollout
+#   - multi_step_pde_detach=0: Full gradient through all steps
+# 
+# This should help with:
+#   - Reducing exposure bias (model sees its own predictions during training)
+#   - Learning to handle error accumulation over multiple steps
+#   - Better stability for long-term rollout inference
+# 
+# Phase 1 (steps 0-9999): Pure GRF training with PDE loss + soft-L∞ + multi-step
 #   - GRF parameters (alpha/tau) are fixed
-# Phase 2 (steps 20000+): Learnable GRF mode
+# Phase 2 (steps 10000+): Learnable GRF mode
 #   - GRF alpha/tau become trainable via PDE loss gradient
 #   - Separate optimizer with smaller lr (model_lr * 0.1)
 # 
@@ -19,27 +31,55 @@ DATA_PATH="/zhangtao/project2026/OmniFluids/nse2d/data/qruio_data/5field_mhd_bat
 EVAL_DATA_PATH="/zhangtao/project2026/OmniFluids/nse2d/data/qruio_data/5field_mhd_batch_test/data/5field_mhd_dataset.pt"
 EVAL_GRF_DATA_PATH="/zhangtao/project2026/OmniFluids/nse2d/data/grf_testset/grf_testset_B10_T50_dt1.0_fromdata_radial_dealiased_seed1000.pt"
 
-EXP_NAME="exp14_learnable_grf"
-GPU_IDS=${1:-"0,1,2,3"}
+EXP_NAME="exp21_learnable_grf_10k_soft_linf_multistep"
+GPU_IDS=${1:-"0,1"}  # Default: 2 GPUs
 NUM_GPUS=$(echo "$GPU_IDS" | tr ',' '\n' | wc -l)
 
 # Training configuration
 NUM_ITERATIONS=200000
 
 # Learnable GRF configuration
-LEARNABLE_GRF_START=20000
+LEARNABLE_GRF_START=10000
 LEARNABLE_GRF_LR_RATIO=0.1
 LEARNABLE_GRF_REG_WEIGHT=0.01
 LEARNABLE_GRF_LOG_EVERY=500
 
+# Soft-L∞ loss configuration (RMS-normalized, per-sample)
+SOFT_LINF_WEIGHT=0.1
+SOFT_LINF_BETA=10.0
+
+# ============================================================
+# NEW: Multi-step PDE loss configuration
+# ============================================================
+MULTI_STEP_PDE_LOSS=1       # Enable multi-step rollout training
+MULTI_STEP_PDE_N=3          # Number of autoregressive steps
+MULTI_STEP_PDE_DETACH=1     # 1=detach intermediate (workaround for inplace op bug)
+
+# ============================================================
+# ADJUSTED: Reduce batch_size due to multi-step memory usage
+# 3-step rollout requires ~3x memory for activations
+# batch_size=2 → each GPU gets 2 samples × 3 steps = 6 forward passes
+# (batch_size=4 caused OOM on H800 80GB)
+# ============================================================
+BATCH_SIZE=2                # 2 samples per GPU for 2-GPU setup (OOM fix)
+
 echo "========================================================================="
-echo "  Exp14: Learnable GRF (Multi-GPU via Accelerate)"
+echo "  Exp21: Learnable GRF (10k) + Soft-L∞ + Multi-Step PDE Loss"
 echo "========================================================================="
 echo "  GPU_IDS: $GPU_IDS"
 echo "  NUM_GPUS: $NUM_GPUS"
 echo ""
+echo "  *** NEW: Multi-Step PDE Loss ***"
+echo "    multi_step_pde_loss=$MULTI_STEP_PDE_LOSS"
+echo "    multi_step_pde_n=$MULTI_STEP_PDE_N (3-step autoregressive rollout)"
+echo "    multi_step_pde_detach=$MULTI_STEP_PDE_DETACH (full gradient)"
+echo "    batch_size=$BATCH_SIZE (reduced from 10 for memory)"
+echo ""
+echo "  Soft-L∞ loss: weight=$SOFT_LINF_WEIGHT, beta=$SOFT_LINF_BETA"
+echo "    (RMS-normalized, per-sample, per-field)"
+echo ""
 echo "  Phase 1: steps 0-$((LEARNABLE_GRF_START-1))"
-echo "    - Pure GRF input, PDE loss (Crank-Nicolson)"
+echo "    - Pure GRF input, PDE loss + soft-L∞ + multi-step (Crank-Nicolson)"
 echo "    - GRF parameters (alpha/tau) are FIXED"
 echo ""
 echo "  Phase 2: steps ${LEARNABLE_GRF_START}-$((NUM_ITERATIONS-1))"
@@ -48,17 +88,17 @@ echo "    - GRF lr = model_lr * $LEARNABLE_GRF_LR_RATIO"
 echo "    - Regularization weight: $LEARNABLE_GRF_REG_WEIGHT"
 echo ""
 echo "  Time integrator: Crank-Nicolson (fixed)"
+echo "  Eval every 2000 steps, checkpoint every 10000 steps"
 echo "========================================================================="
 echo ""
 
-# Use accelerate launch for multi-GPU with specified GPUs
 export CUDA_VISIBLE_DEVICES=$GPU_IDS
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 /zhangtao/envs/rae/bin/accelerate launch --multi_gpu \
     --num_processes=$NUM_GPUS \
     --mixed_precision=no \
-    --main_process_port=29514 \
+    --main_process_port=29531 \
     main.py \
     --mode train \
     --use_accelerate 1 \
@@ -71,6 +111,11 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
     --physics_loss_weight 1.0 \
     --supervised_loss_weight 0.0 \
     --mae_weight 0.0 \
+    --soft_linf_weight $SOFT_LINF_WEIGHT \
+    --soft_linf_beta $SOFT_LINF_BETA \
+    --multi_step_pde_loss $MULTI_STEP_PDE_LOSS \
+    --multi_step_pde_n $MULTI_STEP_PDE_N \
+    --multi_step_pde_detach $MULTI_STEP_PDE_DETACH \
     --grf_use_radial_mask 1 \
     --learnable_grf 1 \
     --learnable_grf_start_step $LEARNABLE_GRF_START \
@@ -96,7 +141,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
     --input_noise_scale 0.0 \
     --lr 0.001 \
     --lr_end 1e-7 \
-    --batch_size 10 \
+    --batch_size $BATCH_SIZE \
     --num_iterations $NUM_ITERATIONS \
     --log_every 100 \
     --eval_every 2000 \

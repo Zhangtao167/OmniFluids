@@ -12,7 +12,7 @@ set -e
 cd /zhangtao/project2026/OmniFluids/nse2d/pretrain
 
 # Configuration
-GPU_ID=${1:-0}
+GPU_ID=${1:-5}
 N_SAMPLES=10
 N_STEPS=50
 DT_DATA=1.0

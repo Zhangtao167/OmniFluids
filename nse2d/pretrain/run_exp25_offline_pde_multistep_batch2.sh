@@ -1,20 +1,24 @@
 #!/bin/bash
 # =============================================================================
-# 实验: 纯 Offline + PDE Loss 训练
-# 
-# 特点:
-#   - 完全使用 offline 仿真数据 (5field_mhd_batch)
-#   - 纯 PDE loss (physics_loss_weight=1.0, supervised_loss_weight=0.0)
-#   - 同时在 MHD 和 GRF 测试集上评估
-#   - 每 5000 step 评估和保存 checkpoint
+# Exp25: Offline PDE-only control with exp22-style batch/multistep settings
+#
+# Purpose:
+#   - Keep the offline PDE-only setup from run_exp_offline_pde.sh
+#   - Only align batch_size and training multi-step rollout settings with exp22
+#   - Help isolate whether batch_size=2 and multi-step PDE rollout itself
+#     changes behavior, without self-training / learnable GRF / soft-Linf
+#
+# Compared with run_exp_offline_pde.sh:
+#   - batch_size: 8 -> 2
+#   - multi_step_pde_loss: 0 -> 1
+#   - multi_step_pde_n: 3
+#   - multi_step_pde_detach: 1
+# Everything else is kept the same as the offline PDE baseline.
 # =============================================================================
 
 set -e
 
-# Activate environment
-# source /opt/conda/bin/activate
-# conda activate /zhangtao/envs/rae || true
-# cd /zhangtao/project2026/OmniFluids/nse2d/pretrain
+cd /zhangtao/project2026/OmniFluids/nse2d/pretrain
 
 # Data paths
 DATA_PATH="/zhangtao/project2026/OmniFluids/nse2d/data/qruio_data/5field_mhd_batch/data/5field_mhd_dataset.pt"
@@ -22,20 +26,31 @@ EVAL_DATA_PATH="/zhangtao/project2026/OmniFluids/nse2d/data/qruio_data/5field_mh
 EVAL_GRF_PATH="/zhangtao/project2026/OmniFluids/nse2d/data/grf_testset/grf_testset_B10_T50_dt1.0_fromdata_radial_dealiased_seed1000.pt"
 
 # Experiment name
-EXP_NAME="exp_offline_pde_only_single_gpu"
+EXP_NAME="exp25_offline_pde_multistep_batch2_single_gpu"
 
-# GPU configuration (可以通过参数覆盖)
-GPUS=${1:-"0"}
-IFS=',' read -ra GPU_ARR <<< "$GPUS"
-NUM_PROCESSES=${#GPU_ARR[@]}
+# GPU configuration (single-process control run)
+GPU=${1:-"0"}
+
+# Match exp22 only on batch size and multi-step rollout settings
+BATCH_SIZE=2
+MULTI_STEP_PDE_LOSS=1
+MULTI_STEP_PDE_N=3
+MULTI_STEP_PDE_DETACH=1
 
 echo "========================================================================="
-echo "  实验: 纯 Offline + PDE Loss 训练"
+echo "  Exp25: Offline PDE-only control (batch/multistep matched to exp22)"
 echo "========================================================================="
-echo "  GPUs: $GPUS (num_processes: $NUM_PROCESSES)"
+echo "  GPU: $GPU (single-process control run)"
 echo "  Training data: $DATA_PATH"
 echo "  MHD test data: $EVAL_DATA_PATH"
 echo "  GRF test data: $EVAL_GRF_PATH"
+echo ""
+echo "  Base setup: same as run_exp_offline_pde.sh"
+echo "  Control changes vs baseline:"
+echo "    batch_size=$BATCH_SIZE"
+echo "    multi_step_pde_loss=$MULTI_STEP_PDE_LOSS"
+echo "    multi_step_pde_n=$MULTI_STEP_PDE_N"
+echo "    multi_step_pde_detach=$MULTI_STEP_PDE_DETACH"
 echo ""
 echo "  Loss: PDE loss only (physics_loss_weight=1.0)"
 echo "  Eval: every 5000 steps on both MHD and GRF test sets"
@@ -43,7 +58,7 @@ echo "  Checkpoint: every 5000 steps"
 echo "========================================================================="
 echo ""
 
-export CUDA_VISIBLE_DEVICES=$GPUS
+export CUDA_VISIBLE_DEVICES=$GPU
 
 /zhangtao/envs/rae/bin/python main.py \
     --mode train \
@@ -56,6 +71,9 @@ export CUDA_VISIBLE_DEVICES=$GPUS
     --physics_loss_weight 1.0 \
     --supervised_loss_weight 0.0 \
     --mae_weight 0.0 \
+    --multi_step_pde_loss $MULTI_STEP_PDE_LOSS \
+    --multi_step_pde_n $MULTI_STEP_PDE_N \
+    --multi_step_pde_detach $MULTI_STEP_PDE_DETACH \
     --time_start 250.0 \
     --time_end 300.0 \
     --Nx 512 --Ny 256 \
@@ -70,7 +88,7 @@ export CUDA_VISIBLE_DEVICES=$GPUS
     --dealias_rhs 0 \
     --input_noise_scale 0.001 \
     --lr 0.002 \
-    --batch_size 8 \
+    --batch_size $BATCH_SIZE \
     --num_iterations 200000 \
     --log_every 100 \
     --eval_every 5000 \

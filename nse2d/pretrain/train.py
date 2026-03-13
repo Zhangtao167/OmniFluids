@@ -380,7 +380,8 @@ def evaluate_grf_overfitting(config, net, grf_data, rhs_fn, step_tag='eval', n_e
                 output_dim=config.output_dim,
                 time_integrator=config.time_integrator,
                 mae_weight=0.0,
-                use_relative_loss=getattr(config, 'use_relative_loss', 0) == 1)
+                use_relative_loss=getattr(config, 'use_relative_loss', 0) == 1,
+                relative_loss_fixed_scales=getattr(config, 'relative_loss_fixed_scales', ''))
             phys_losses.append(phys_loss.item())
             
             # Per-field RMS of predictions
@@ -757,6 +758,56 @@ def _make_self_training_generator(grf, training_net, config, device='cpu', verbo
         generator_net, grf, rollout_steps=rollout_steps, device=device, verbose=verbose)
 
 
+def _load_best_teacher_checkpoint(run_dir, run_tag, map_location='cpu'):
+    """Load current best checkpoint state_dict for best-teacher self-training."""
+    best_path = os.path.join(run_dir, 'model', f'best-{run_tag}.pt')
+    if not os.path.exists(best_path):
+        return None, None, None
+    ckpt = torch.load(best_path, map_location=map_location, weights_only=False)
+    return ckpt['model_state_dict'], ckpt.get('step', None), ckpt.get('best_loss', None)
+
+
+def _refresh_self_training_generator(model_evolved_generator, training_net, config,
+                                     run_tag, is_main_process):
+    """Refresh self-training generator weights from current or best teacher."""
+    teacher_source = getattr(config, 'self_training_teacher_source', 'current')
+    if teacher_source == 'best':
+        best_state_dict, best_step, best_loss = _load_best_teacher_checkpoint(
+            config.run_dir, run_tag, map_location='cpu')
+        if best_state_dict is not None:
+            source_label = f'best checkpoint step {best_step}'
+            if best_loss is not None:
+                source_label += f' (MHD L2={best_loss:.6f})'
+            model_evolved_generator.update_model_weights(
+                source_state_dict=best_state_dict,
+                source_label=source_label)
+            return source_label
+        if is_main_process:
+            print('[WARNING] Best-teacher mode requested but best checkpoint not found; '
+                  'falling back to current training model.')
+    model_evolved_generator.update_model_weights(
+        source_model=training_net,
+        source_label='current training model')
+    return 'current training model'
+
+
+def _get_self_training_rollout_steps(step, config):
+    """Return rollout depth for self-training generator, with optional curriculum."""
+    base_steps = max(1, int(getattr(config, 'self_training_rollout_steps', 10)))
+    max_steps = int(getattr(config, 'self_training_rollout_curriculum_max_rollout_steps', 0))
+    interval = int(getattr(config, 'self_training_rollout_curriculum_every', 10000))
+    start_step = int(getattr(config, 'self_training_start_step', 0))
+    if max_steps <= 0 or step < start_step:
+        return base_steps
+    if interval <= 0:
+        raise ValueError(
+            'self_training_rollout_curriculum_every must be > 0 when '
+            'self_training_rollout_curriculum_max_rollout_steps is enabled'
+        )
+    increments = max(0, (step - start_step) // interval)
+    return min(base_steps + increments, max_steps)
+
+
 def _make_scheduler(optimizer, lr_start, lr_end, total_steps, step_interval=500):
     """Cosine-power annealing: lr_start -> lr_end over total_steps.
 
@@ -895,6 +946,37 @@ def _get_euler_weight(step, config):
 
 
 # ---------------------------------------------------------------------------
+# Local ensemble target helper
+# ---------------------------------------------------------------------------
+
+def _expand_local_ensemble_inputs(x_clean, config):
+    """Expand each clean sample into local noisy ensemble members.
+
+    Returns:
+        (x_flat, ensemble_group_size)
+        x_flat has shape (B * E, ...) and preserves grouping order so that
+        samples [b*E:(b+1)*E] belong to the same clean sample.
+    """
+    ensemble_group_size = int(getattr(config, 'ensemble_num_samples', 1))
+    if ensemble_group_size < 1:
+        raise ValueError('ensemble_num_samples must be >= 1')
+
+    keep_clean = bool(getattr(config, 'ensemble_keep_clean', 1))
+    noise_scale = float(getattr(config, 'ensemble_noise_scale', 0.0))
+
+    B = x_clean.shape[0]
+    grouped = x_clean.unsqueeze(1).expand(B, ensemble_group_size, *x_clean.shape[1:]).clone()
+
+    noise_start = 1 if keep_clean else 0
+    if noise_scale > 0 and ensemble_group_size > noise_start:
+        noisy_view = grouped[:, noise_start:]
+        noisy_view.add_(noise_scale * torch.randn_like(noisy_view))
+
+    x_flat = grouped.reshape(B * ensemble_group_size, *x_clean.shape[1:])
+    return x_flat, ensemble_group_size
+
+
+# ---------------------------------------------------------------------------
 # Unified training step
 # ---------------------------------------------------------------------------
 
@@ -914,10 +996,22 @@ def _train_step(net, x_0, rhs_fn, optimizer, scheduler, config, x_target=None,
     Returns:
         (loss_value, loss_components): loss value and dict with component losses
     """
+    use_ensemble_target = bool(getattr(config, 'use_ensemble_target', 0))
+    ensemble_group_size = 1
+    if use_ensemble_target:
+        if x_target is not None:
+            raise ValueError('use_ensemble_target currently supports physics-only training '
+                             '(x_target must be None)')
+        if getattr(config, 'physics_loss_weight', 1.0) <= 0:
+            raise ValueError('use_ensemble_target requires physics_loss_weight > 0')
+
     x_ref = x_0
-    noise_scale = getattr(config, 'input_noise_scale', 0.0)
-    if noise_scale > 0:
-        x_0 = x_0 + noise_scale * torch.randn_like(x_0)
+    if use_ensemble_target:
+        x_0, ensemble_group_size = _expand_local_ensemble_inputs(x_0, config)
+    else:
+        noise_scale = getattr(config, 'input_noise_scale', 0.0)
+        if noise_scale > 0:
+            x_0 = x_0 + noise_scale * torch.randn_like(x_0)
     
     # Dealias input to prevent aliasing in nonlinear RHS terms
     if getattr(config, 'dealias_input', True) and mhd is not None:
@@ -956,7 +1050,9 @@ def _train_step(net, x_0, rhs_fn, optimizer, scheduler, config, x_target=None,
                     time_integrator=config.time_integrator,
                     mae_weight=getattr(config, 'mae_weight', 0.0),
                     euler_weight=euler_weight,
-                    use_relative_loss=getattr(config, 'use_relative_loss', 0) == 1)
+                    ensemble_group_size=ensemble_group_size,
+                    use_relative_loss=getattr(config, 'use_relative_loss', 0) == 1,
+                    relative_loss_fixed_scales=getattr(config, 'relative_loss_fixed_scales', ''))
                 total_euler_loss += integrator_losses['euler']
                 total_cn_loss += integrator_losses['cn']
             else:
@@ -969,7 +1065,9 @@ def _train_step(net, x_0, rhs_fn, optimizer, scheduler, config, x_target=None,
                     mae_weight=getattr(config, 'mae_weight', 0.0),
                     soft_linf_weight=getattr(config, 'soft_linf_weight', 0.0),
                     soft_linf_beta=getattr(config, 'soft_linf_beta', 10.0),
-                    use_relative_loss=getattr(config, 'use_relative_loss', 0) == 1)
+                    ensemble_group_size=ensemble_group_size,
+                    use_relative_loss=getattr(config, 'use_relative_loss', 0) == 1,
+                    relative_loss_fixed_scales=getattr(config, 'relative_loss_fixed_scales', ''))
             
             # Accumulate loss (no averaging across steps)
             total_phys_loss = total_phys_loss + step_phys_loss
@@ -985,6 +1083,8 @@ def _train_step(net, x_0, rhs_fn, optimizer, scheduler, config, x_target=None,
         phys_loss = total_phys_loss
         loss_components['phys'] = phys_loss.item()
         loss_components['multi_step_n'] = multi_step_n
+        loss_components['ensemble_num_samples'] = ensemble_group_size
+        loss_components['ensemble_target'] = float(use_ensemble_target)
         
         if euler_weight is not None:
             loss_components['euler_loss'] = total_euler_loss
@@ -1628,6 +1728,16 @@ def train(config, net, accelerator=None):
             init_grf_loss = init_grf_results['mean_rel_l2']
             print(f'  [Summary] MHD L2={best_loss:.6f}, GRF L2={init_grf_loss:.6f}')
         
+        init_best_path = os.path.join(config.run_dir, 'model', f'best-{run_tag}.pt')
+        torch.save({
+            'model_state_dict': eval_net.state_dict(),
+            'config': vars(config),
+            'step': 0,
+            'best_loss': best_loss,
+            'eval_results': init_results,
+        }, init_best_path)
+        print(f'  -> Saved initial best (MHD): {init_best_path} (L2={best_loss:.6f})')
+        
         sys.stdout.flush()
     else:
         best_loss = float('inf')
@@ -1663,23 +1773,49 @@ def train(config, net, accelerator=None):
     # Self-training configuration
     self_training_start = getattr(config, 'self_training_start_step', 0)
     self_training_update_every = getattr(config, 'self_training_update_every', 0)
+    self_training_teacher_source = getattr(config, 'self_training_teacher_source', 'current')
+    self_training_rollout_base = int(getattr(config, 'self_training_rollout_steps', 10))
+    self_training_rollout_curriculum_every = int(
+        getattr(config, 'self_training_rollout_curriculum_every', 10000))
+    self_training_rollout_curriculum_max = int(
+        getattr(config, 'self_training_rollout_curriculum_max_rollout_steps', 0))
+    if (self_training_rollout_curriculum_max > 0
+            and self_training_rollout_curriculum_max < self_training_rollout_base):
+        raise ValueError(
+            'self_training_rollout_curriculum_max_rollout_steps must be >= '
+            'self_training_rollout_steps when curriculum is enabled'
+        )
+    if is_main_process and self_training_start > 0:
+        print(f'  [Self-Training Config] teacher_source={self_training_teacher_source}')
+        if self_training_rollout_curriculum_max > 0:
+            print('  [Self-Training Config] rollout curriculum: '
+                  f'start={self_training_rollout_base}, '
+                  f'interval={self_training_rollout_curriculum_every}, '
+                  f'max={self_training_rollout_curriculum_max}')
     
     while global_step < config.num_iterations:
         source = _get_source(global_step)
         
         # === Self-training mode: activation and periodic weight updates ===
         if model_evolved_generator is not None and not use_fixed_grf:
+            desired_rollout_steps = _get_self_training_rollout_steps(global_step, config)
+            if model_evolved_generator.is_active():
+                model_evolved_generator.set_rollout_steps(desired_rollout_steps)
+            
             # Check if we need to activate self-training
             if (not model_evolved_generator.is_active() 
                 and self_training_start > 0 
                 and global_step >= self_training_start):
-                # Update weights from current training model before activation
+                model_evolved_generator.set_rollout_steps(desired_rollout_steps)
                 source_net = accelerator.unwrap_model(net) if accelerator is not None else net
-                model_evolved_generator.update_model_weights(source_net)
+                teacher_label = _refresh_self_training_generator(
+                    model_evolved_generator, source_net, config, run_tag, is_main_process)
                 model_evolved_generator.activate()
                 if is_main_process:
                     print(f'\n[Self-Training] ACTIVATED at step {global_step}')
-                    print(f'  Data will now be: GRF -> Model({self_training_start}) -> evolved state\n')
+                    print(f'  Teacher source: {teacher_label}')
+                    print(f'  Generator rollout steps: {model_evolved_generator.rollout_steps}')
+                    print(f'  Data will now be: GRF -> Model({model_evolved_generator.rollout_steps} steps) -> evolved state\n')
                     sys.stdout.flush()
             
             # Check if we need to update weights (only for self-training mode, not external model)
@@ -1689,9 +1825,12 @@ def train(config, net, accelerator=None):
                   and global_step > self_training_start
                   and (global_step - self_training_start) % self_training_update_every == 0):
                 source_net = accelerator.unwrap_model(net) if accelerator is not None else net
-                model_evolved_generator.update_model_weights(source_net)
+                teacher_label = _refresh_self_training_generator(
+                    model_evolved_generator, source_net, config, run_tag, is_main_process)
                 if is_main_process:
-                    print(f'\n[Self-Training] Weights REFRESHED at step {global_step}\n')
+                    print(f'\n[Self-Training] Weights REFRESHED at step {global_step}')
+                    print(f'  Teacher source: {teacher_label}')
+                    print(f'  Generator rollout steps: {model_evolved_generator.rollout_steps}\n')
                     sys.stdout.flush()
 
         # Staged mode: reset scheduler at the transition point

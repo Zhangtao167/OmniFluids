@@ -87,11 +87,25 @@ def run_train(cfg):
     
     setup_seed(cfg.seed)
     
-    # Only main process handles logging and dir creation
+    # Only main process creates the canonical run_tag / run_dir.
+    # Broadcast them so every process reads/writes the same run folder.
+    run_tag = None
     if is_main_process:
         run_tag = make_run_tag(cfg)
         make_run_dir(cfg)
-
+    
+    if accelerator is not None:
+        import torch.distributed as dist
+        run_tag_list = [run_tag]
+        if dist.is_available() and dist.is_initialized():
+            dist.broadcast_object_list(run_tag_list, src=0)
+        run_tag = run_tag_list[0]
+        cfg.run_tag = run_tag
+        cfg.run_dir = os.path.join('results', cfg.exp_name, run_tag)
+    else:
+        cfg.run_tag = run_tag
+    
+    if is_main_process:
         logfile = os.path.join(cfg.run_dir, 'log', f'log-{run_tag}.txt')
         # Redirect both stdout and stderr to the same log file
         log_handle = open(logfile, 'w')
@@ -105,10 +119,6 @@ def run_train(cfg):
             print(f'  {k}: {v}')
         print('=' * 60)
         sys.stdout.flush()
-    else:
-        # Non-main processes only need run_tag and run_dir path, NOT create dirs
-        run_tag = make_run_tag(cfg)
-        cfg.run_dir = os.path.join('results', cfg.exp_name, run_tag)
     
     # Sync before model creation
     if accelerator is not None:
@@ -263,6 +273,18 @@ if __name__ == "__main__":
                         help='Dealias inside RHS function (default=0, redundant if dealias_input=1)')
     parser.add_argument('--input_noise_scale', type=float, default=0.001,
                         help='Scale of additive Gaussian noise on training input')
+    parser.add_argument('--use_ensemble_target', type=int, default=0,
+                        help='1=expand each clean sample into local noisy ensemble members '
+                             'and use the ensemble-mean RHS as the physics target')
+    parser.add_argument('--ensemble_num_samples', type=int, default=4,
+                        help='Number of local ensemble members per clean sample when '
+                             'use_ensemble_target=1')
+    parser.add_argument('--ensemble_noise_scale', type=float, default=0.001,
+                        help='Gaussian noise scale used to perturb ensemble members '
+                             'when use_ensemble_target=1')
+    parser.add_argument('--ensemble_keep_clean', type=int, default=1,
+                        help='1=keep the first ensemble member unperturbed, '
+                             '0=perturb all ensemble members')
     parser.add_argument('--mae_weight', type=float, default=0.0,
                         help='Weight for MAE loss term (0=off, e.g. 0.1)')
     parser.add_argument('--soft_linf_weight', type=float, default=0.0,
@@ -271,6 +293,10 @@ if __name__ == "__main__":
                         help='β parameter for soft-L∞ (larger = closer to true L∞)')
     parser.add_argument('--use_relative_loss', type=int, default=0,
                         help='1=normalize PDE residual by target per-field RMS before MSE/MAE')
+    parser.add_argument('--relative_loss_fixed_scales', type=str, default='',
+                        help='Optional comma-separated fixed per-field scales for '
+                             'relative PDE loss in channel order n,U,vpar,psi,Ti. '
+                             'Empty string keeps the default target-RMS normalization.')
     parser.add_argument('--supervised_loss_weight', type=float, default=0.0,
                         help='Weight for supervised loss on real data (0=off, e.g. 1.0)')
     parser.add_argument('--supervised_mse_weight', type=float, default=1.0,
@@ -364,11 +390,25 @@ if __name__ == "__main__":
     parser.add_argument('--self_training_start_step', type=int, default=0,
                         help='Step to start using model-evolved data (0=disabled). '
                              'Before this step, uses raw GRF. After, uses model-evolved GRF.')
+    parser.add_argument('--self_training_teacher_source', type=str, default='current',
+                        choices=['current', 'best'],
+                        help='Teacher source for self-training generator refresh: '
+                             'current=copy latest training model, '
+                             'best=load current best MHD checkpoint before activation/refresh')
     parser.add_argument('--self_training_update_every', type=int, default=5000,
                         help='Update data generator model weights every N steps (0=never update). '
                              'Only applies to self-training mode.')
     parser.add_argument('--self_training_rollout_steps', type=int, default=10,
                         help='Number of model inference steps to evolve GRF in self-training mode')
+    parser.add_argument('--self_training_rollout_curriculum_every', type=int, default=10000,
+                        help='Training-step interval for rollout-depth curriculum. '
+                             'Only used when self_training_rollout_curriculum_max_rollout_steps > 0.')
+    parser.add_argument('--self_training_rollout_curriculum_max_rollout_steps', type=int, default=0,
+                        help='If >0, enable self-training rollout-depth curriculum: '
+                             'start from self_training_rollout_steps at activation, '
+                             'increase by 1 every self_training_rollout_curriculum_every steps '
+                             'after self_training_start_step, capped at this rollout depth. '
+                             '0=disabled.')
 
     # External pretrained model mode: use a fixed pretrained model to generate data
     parser.add_argument('--pretrained_model_path', type=str, default=None,

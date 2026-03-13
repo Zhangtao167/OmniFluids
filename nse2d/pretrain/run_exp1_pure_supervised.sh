@@ -16,8 +16,8 @@ DATA_PATH="/zhangtao/project2026/OmniFluids/nse2d/data/qruio_data/5field_mhd_bat
 EVAL_DATA_PATH="/zhangtao/project2026/OmniFluids/nse2d/data/qruio_data/5field_mhd_batch_test/data/5field_mhd_dataset.pt"
 EVAL_GRF_PATH="/zhangtao/project2026/OmniFluids/nse2d/data/grf_testset/grf_testset_B10_T50_dt1.0_fromdata_radial_dealiased_seed1000.pt"
 
-EXP_NAME="exp1b_pure_supervised_dt1s_multigpu"
-GPUS=${1:-"0,1,2,3"}
+EXP_NAME="exp1b_pure_supervised_dt1s_signle_gpu"
+GPUS=${1:-"1"}
 
 echo "========================================================================="
 echo "  实验1b: 纯监督Loss (rollout_dt=1.0s, output_dim=10) - 多卡"
@@ -30,9 +30,9 @@ echo ""
 
 export CUDA_VISIBLE_DEVICES=$GPUS
 
-accelerate launch --multi_gpu --num_processes=4 --main_process_port=29503 main.py \
+/zhangtao/envs/rae/bin/python main.py \
     --mode train \
-    --use_accelerate 1 \
+    --use_accelerate 0 \
     --exp_name "$EXP_NAME" \
     --data_path "$DATA_PATH" \
     --eval_data_path "$EVAL_DATA_PATH" \
@@ -57,7 +57,7 @@ accelerate launch --multi_gpu --num_processes=4 --main_process_port=29503 main.p
     --time_integrator crank_nicolson \
     --input_noise_scale 0.001 \
     --lr 0.002 \
-    --batch_size 10 \
+    --batch_size 8 \
     --num_iterations 200000 \
     --log_every 100 \
     --eval_every 500 \

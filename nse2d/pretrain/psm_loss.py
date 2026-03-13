@@ -82,10 +82,73 @@ def compute_target_rms_scale(target, eps=1e-8):
     return target.detach().pow(2).mean(dim=(0, 1, 2), keepdim=True).sqrt().clamp(min=eps)
 
 
+def parse_fixed_field_scales(fixed_field_scales, n_fields, device, dtype, eps=1e-8):
+    """Parse optional fixed per-field scales for relative PDE loss."""
+    if fixed_field_scales is None:
+        return None
+
+    if isinstance(fixed_field_scales, str):
+        if not fixed_field_scales.strip():
+            return None
+        try:
+            values = [float(v.strip()) for v in fixed_field_scales.split(',') if v.strip()]
+        except ValueError as exc:
+            raise ValueError(
+                "relative_loss_fixed_scales must be a comma-separated list of floats"
+            ) from exc
+        scales = torch.tensor(values, device=device, dtype=dtype)
+    elif torch.is_tensor(fixed_field_scales):
+        scales = fixed_field_scales.detach().to(device=device, dtype=dtype)
+    else:
+        scales = torch.tensor(list(fixed_field_scales), device=device, dtype=dtype)
+
+    if scales.numel() != n_fields:
+        raise ValueError(
+            f"relative_loss_fixed_scales expects {n_fields} values, got {scales.numel()}"
+        )
+    return scales.reshape(1, 1, 1, n_fields).detach().clamp(min=eps)
+
+
+def get_relative_loss_scale(target, fixed_field_scales=None, eps=1e-8):
+    """Return per-field normalization scale for relative PDE loss."""
+    if fixed_field_scales is not None:
+        return fixed_field_scales
+    return compute_target_rms_scale(target, eps=eps)
+
+
+def average_target_over_local_ensemble(target, ensemble_group_size):
+    """Average targets within each local clean-sample ensemble group.
+
+    Args:
+        target: (B_flat, Nx, Ny, C) flattened local batch
+        ensemble_group_size: Number of ensemble members per clean sample.
+
+    Returns:
+        Tensor of same shape where each ensemble member in the same group shares
+        the group-mean target.
+    """
+    if ensemble_group_size <= 1:
+        return target
+    if target.shape[0] % ensemble_group_size != 0:
+        raise ValueError(
+            f'Batch size {target.shape[0]} is not divisible by ensemble_group_size '
+            f'{ensemble_group_size}'
+        )
+    grouped = target.reshape(
+        target.shape[0] // ensemble_group_size,
+        ensemble_group_size,
+        *target.shape[1:],
+    )
+    mean_target = grouped.mean(dim=1, keepdim=True)
+    return mean_target.expand_as(grouped).reshape_as(target)
+
+
 def compute_physics_loss(pred_traj, x_0, rhs_fn, rollout_dt, output_dim,
                          time_integrator='crank_nicolson', mae_weight=0.0,
                          soft_linf_weight=0.0, soft_linf_beta=10.0,
-                         euler_weight=None, use_relative_loss=False):
+                         euler_weight=None, ensemble_group_size=1,
+                         use_relative_loss=False,
+                         relative_loss_fixed_scales=None):
     """Multi-frame physics loss using mhd_sim's RHS.
 
     For each consecutive frame pair in the trajectory, enforce:
@@ -95,14 +158,23 @@ def compute_physics_loss(pred_traj, x_0, rhs_fn, rollout_dt, output_dim,
 
     Total loss = MSE + mae_weight * MAE + soft_linf_weight * soft-L∞ (per-frame averaged).
 
+    When ensemble_group_size > 1, targets are first averaged within each local
+    clean-sample ensemble group and that shared mean target is used for the
+    residual. This preserves per-sample grouping even when the local batch has
+    multiple clean samples.
+
     When use_relative_loss=True, the MSE/MAE terms are computed on
-    residual / target_rms_per_field, where target_rms_per_field is detached
-    and computed from the RHS target over batch and spatial dimensions.
+    residual / scale_per_field. By default, scale_per_field is the detached
+    RHS target RMS computed over batch and spatial dimensions. If
+    relative_loss_fixed_scales is provided, those fixed per-field values are
+    used instead.
 
     The soft-L∞ loss uses the Log-Sum-Exp (LSE) smooth approximation:
         soft-L∞_c = (1/β) * (logsumexp(β * |r̃_c|) - ln(N_spatial))
     where r̃_c = |residual_c| / scale_c is the field-normalized residual.
-    If use_relative_loss=True, scale_c = RMS(target_c).detach().
+    If use_relative_loss=True, scale_c comes from either:
+        - RMS(target_c).detach(), or
+        - the provided fixed per-field scale.
     Otherwise, scale_c = RMS(residual_c).detach(),
     and β controls sharpness (larger β → closer to true L∞).
     Computed per-sample, per-field, then averaged over batch and summed over fields.
@@ -121,8 +193,14 @@ def compute_physics_loss(pred_traj, x_0, rhs_fn, rollout_dt, output_dim,
             - Computes both Euler and CN losses separately
             - Returns combined loss = euler_weight * euler_loss + (1 - euler_weight) * cn_loss
             - Also returns individual losses as dict
+        ensemble_group_size: Number of local ensemble members per clean sample.
+            When >1, targets are averaged within each ensemble group before
+            computing residuals.
         use_relative_loss: If True, normalize residual by detached per-field
             RMS of the target RHS before computing MSE/MAE
+        relative_loss_fixed_scales: Optional fixed per-field scales used when
+            use_relative_loss=True. Accepts a comma-separated string or an
+            iterable/tensor with one value per field in channel order.
 
     Returns:
         If euler_weight is None: scalar loss
@@ -130,6 +208,14 @@ def compute_physics_loss(pred_traj, x_0, rhs_fn, rollout_dt, output_dim,
     """
     dt = rollout_dt / output_dim
     full_traj = torch.cat([x_0.unsqueeze(-1), pred_traj], dim=-1)
+    fixed_field_scales = None
+    if use_relative_loss:
+        fixed_field_scales = parse_fixed_field_scales(
+            relative_loss_fixed_scales,
+            n_fields=x_0.shape[-1],
+            device=x_0.device,
+            dtype=x_0.dtype,
+        )
 
     # Mixed integrator mode: compute both Euler and CN losses separately
     if euler_weight is not None:
@@ -143,10 +229,15 @@ def compute_physics_loss(pred_traj, x_0, rhs_fn, rollout_dt, output_dim,
             
             # Euler target: rhs(t)
             rhs_t = rhs_fn(state_t)
-            target_euler = rhs_t.detach()
+            target_euler_raw = rhs_t.detach()
+            target_euler = average_target_over_local_ensemble(
+                target_euler_raw, ensemble_group_size
+            )
             residual_euler = time_diff - target_euler
             if use_relative_loss:
-                target_scale = compute_target_rms_scale(target_euler)
+                target_scale = get_relative_loss_scale(
+                    target_euler_raw, fixed_field_scales=fixed_field_scales
+                )
                 residual_euler = residual_euler / target_scale
             total_euler_mse = total_euler_mse + (residual_euler ** 2).mean()
             
@@ -154,10 +245,15 @@ def compute_physics_loss(pred_traj, x_0, rhs_fn, rollout_dt, output_dim,
             # Only compute rhs_tp1 if we need CN loss (euler_weight < 1)
             if euler_weight < 1.0 - 1e-6:
                 rhs_tp1 = rhs_fn(state_tp1)
-                target_cn = ((rhs_t + rhs_tp1) / 2.0).detach()
+                target_cn_raw = ((rhs_t + rhs_tp1) / 2.0).detach()
+                target_cn = average_target_over_local_ensemble(
+                    target_cn_raw, ensemble_group_size
+                )
                 residual_cn = time_diff - target_cn
                 if use_relative_loss:
-                    target_scale = compute_target_rms_scale(target_cn)
+                    target_scale = get_relative_loss_scale(
+                        target_cn_raw, fixed_field_scales=fixed_field_scales
+                    )
                     residual_cn = residual_cn / target_scale
                 total_cn_mse = total_cn_mse + (residual_cn ** 2).mean()
         
@@ -190,11 +286,14 @@ def compute_physics_loss(pred_traj, x_0, rhs_fn, rollout_dt, output_dim,
         else:
             raise ValueError(f"Unknown integrator: {time_integrator}")
 
-        target = target.detach()
+        target_raw = target.detach()
+        target = average_target_over_local_ensemble(target_raw, ensemble_group_size)
         residual = time_diff - target  # (B, Nx, Ny, 5)
         target_scale = None
         if use_relative_loss:
-            target_scale = compute_target_rms_scale(target)
+            target_scale = get_relative_loss_scale(
+                target_raw, fixed_field_scales=fixed_field_scales
+            )
             residual = residual / target_scale
         total_mse = total_mse + (residual ** 2).mean()
         if mae_weight > 0:
